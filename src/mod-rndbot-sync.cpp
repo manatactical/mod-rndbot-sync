@@ -29,6 +29,7 @@
 #include "WorldSession.h"
 #include "ObjectAccessor.h"
 #include "Map.h"
+#include "GameTime.h"
 #include "DatabaseEnv.h"
 #include "QueryResult.h"
 #include "ArenaTeamMgr.h"
@@ -43,6 +44,7 @@
 #include "PlayerbotFactory.h"
 #include "TravelMgr.h"
 #include "Group.h"
+#include "SocialMgr.h"
 #include "Item.h"
 #include "Bag.h"
 #include "ItemTemplate.h"
@@ -58,6 +60,11 @@
 
 using namespace Acore::ChatCommands;
 
+// Defined further down; the target/eligibility helpers above need them.
+static bool IsHumanPlayer(Player* player);
+static bool IsPlayerRandomBot(Player* player);
+static bool IsBotExcluded(Player* bot);
+
 // ---- Configuration -----------------------------------------------------------
 static bool   g_Enabled = true;
 static uint32 g_CheckFrequency = 300;              // seconds; 0 = events only
@@ -69,7 +76,7 @@ static bool   g_IgnoreGuildBotsWithRealPlayers = true;
 static bool   g_IgnoreFriendListed = true;
 static bool   g_IgnoreArenaTeamBots = true;
 static bool   g_IgnoreGroupedBots = true;          // bots in any party/raid
-static std::vector<std::string> g_ExcludeBotNames;
+static std::unordered_set<std::string> g_ExcludeBotNames;
 static uint32 g_GuildCacheRefreshFrequency = 600;  // seconds
 static bool   g_DkProgressionEnabled = false;
 static uint32 g_DkRequiredState = 13;              // PROGRESSION_TBC_TIER_5
@@ -80,6 +87,13 @@ static int32 g_OriginalGearScoreLimit = 0;  // configured AiPlayerbot.RandomGear
 static bool   g_AreaSyncEnabled = true;     // gather bots into the player's zone
 static uint32 g_AreaSyncZone = 0;           // fixed zone id; 0 = follow the player's zone
 static bool   g_AreaSyncUsePlayerZone = true; // true = use the player's current zone id
+
+// mod-playerbots' own baseline, captured on the first EvaluateDeathKnightGate() call so the
+// module can restore it when DeathKnightProgression is switched off (instead of leaving its
+// override in place). Captured there, not in LoadConfig(), because mod-playerbots reads its
+// own config in its own OnInit and this module must not race that.
+static bool g_OriginalDisableDkLogin = false;
+static bool g_OriginalDkCaptured = false;
 
 // Zone the pass should gather bots into: a pinned zone, or the target player's zone.
 // The player's zone is resolved once per pass and reused, so a bot is never moved into
@@ -98,19 +112,89 @@ static uint8  g_RandomBotMinLevel = 1;
 static uint8  g_RandomBotMaxLevel = 80;
 static std::string g_RandomBotAccountPrefix = "rndbot";
 
+// Converts a field to the value mod-playerbots stores in `character_social.friend`: the
+// low GUID (character counter). Used for the friend cache; also the form to fall back to
+// should a bot ever carry a non-player high GUID.
+static inline uint32 LowGuidValue(Player const* player)
+{
+    return player->GetGUID().GetCounter();
+}
+
+// The highest-level real player online, or nullptr when none is. Shared by the adjustment
+// pass and the status command so the two can never disagree about who the target is.
+static Player* FindTargetPlayer(int& targetLevelOut)
+{
+    Player* best = nullptr;
+    targetLevelOut = -1;
+    for (auto const& itr : ObjectAccessor::GetPlayers())
+    {
+        Player* player = itr.second;
+        if (!player || !player->IsInWorld() || !IsHumanPlayer(player))
+        {
+            continue;
+        }
+        if (static_cast<int>(player->GetLevel()) > targetLevelOut)
+        {
+            targetLevelOut = static_cast<int>(player->GetLevel());
+            best = player;
+        }
+    }
+    return best;
+}
+
+// Bots eligible for a level or zone change: in world, random bots, not excluded. Passed
+// over once per pass and shared by the level and zone steps.
+static std::vector<Player*> CollectEligibleBots()
+{
+    std::vector<Player*> eligible;
+    for (auto const& itr : ObjectAccessor::GetPlayers())
+    {
+        Player* bot = itr.second;
+        if (!bot || !bot->IsInWorld() || IsHumanPlayer(bot))
+        {
+            continue;
+        }
+        if (!IsPlayerRandomBot(bot) || IsBotExcluded(bot))
+        {
+            continue;
+        }
+        eligible.push_back(bot);
+    }
+    return eligible;
+}
+
+// The level band for a target: [bandLower, ceiling]. `ceiling` is the target's level plus
+// the band, clamped to both the world player cap and mod-playerbots' own RandomBotMaxLevel —
+// otherwise a module-configured bot cap below the world cap would be exceeded.
+static void ComputeLevelBand(int target, int& bandLowerOut, int& ceilingOut)
+{
+    uint32 const worldMax = sWorld->getIntConfig(CONFIG_MAX_PLAYER_LEVEL);
+    int const maxLevel = std::min(static_cast<int>(worldMax), static_cast<int>(g_RandomBotMaxLevel));
+
+    bandLowerOut = std::max(static_cast<int>(g_RandomBotMinLevel), target - static_cast<int>(g_TargetBand));
+    ceilingOut = std::min(maxLevel, target + static_cast<int>(g_TargetBand));
+    if (bandLowerOut > ceilingOut)
+    {
+        bandLowerOut = ceilingOut;
+    }
+}
+
 static void LoadConfig()
 {
     g_Enabled = sConfigMgr->GetOption<bool>("RndBotSync.Enabled", true);
-    g_CheckFrequency = sConfigMgr->GetOption<uint32>("RndBotSync.CheckFrequency", 300);
-    g_TargetPercent = sConfigMgr->GetOption<uint32>("RndBotSync.TargetPercent", 30);
-    g_TargetBand = sConfigMgr->GetOption<uint32>("RndBotSync.TargetBand", 3);
+    // Clamp the user-configured periods so the millisecond math below cannot overflow and
+    // a stray 0 in one of the "every N seconds" keys cannot turn into a query-per-tick.
+    g_CheckFrequency = std::min<uint32>(sConfigMgr->GetOption<uint32>("RndBotSync.CheckFrequency", 300), 86400);
+    g_TargetPercent = std::min<uint32>(sConfigMgr->GetOption<uint32>("RndBotSync.TargetPercent", 30), 100);
+    g_TargetBand = std::min<uint32>(sConfigMgr->GetOption<uint32>("RndBotSync.TargetBand", 3), 80);
     g_ProcessLimit = sConfigMgr->GetOption<uint32>("RndBotSync.ProcessLimit", 5);
     g_AllowDownleveling = sConfigMgr->GetOption<bool>("RndBotSync.AllowDownleveling", true);
     g_IgnoreGuildBotsWithRealPlayers = sConfigMgr->GetOption<bool>("RndBotSync.IgnoreGuildBotsWithRealPlayers", true);
     g_IgnoreFriendListed = sConfigMgr->GetOption<bool>("RndBotSync.IgnoreFriendListed", true);
     g_IgnoreArenaTeamBots = sConfigMgr->GetOption<bool>("RndBotSync.IgnoreArenaTeamBots", true);
     g_IgnoreGroupedBots = sConfigMgr->GetOption<bool>("RndBotSync.IgnoreGroupedBots", true);
-    g_GuildCacheRefreshFrequency = sConfigMgr->GetOption<uint32>("RndBotSync.GuildCacheRefreshFrequency", 600);
+    g_GuildCacheRefreshFrequency = std::max<uint32>(60, std::min<uint32>(
+        sConfigMgr->GetOption<uint32>("RndBotSync.GuildCacheRefreshFrequency", 600), 86400));
     g_DkProgressionEnabled = sConfigMgr->GetOption<bool>("RndBotSync.DeathKnightProgression.Enabled", false);
     g_DkRequiredState = sConfigMgr->GetOption<uint32>("RndBotSync.DeathKnightProgression.RequiredState", 13);
     g_IlvlSyncEnabled = sConfigMgr->GetOption<bool>("RndBotSync.IlvlSync.Enabled", true);
@@ -148,17 +232,19 @@ static void LoadConfig()
     std::string name;
     while (std::getline(stream, name, ','))
     {
-        name.erase(std::remove_if(name.begin(), name.end(), ::isspace), name.end());
+        name.erase(std::remove_if(name.begin(), name.end(),
+                                  [](unsigned char c) { return ::isspace(c) != 0; }), name.end());
         if (!name.empty())
         {
-            std::transform(name.begin(), name.end(), name.begin(), ::tolower);
-            g_ExcludeBotNames.push_back(name);
+            std::transform(name.begin(), name.end(), name.begin(),
+                           [](unsigned char c) { return static_cast<char>(::tolower(c)); });
+            g_ExcludeBotNames.insert(name);
         }
     }
 }
 
 // ---- Identity ----------------------------------------------------------------
-static std::vector<uint64> g_SocialFriendsList;
+static std::unordered_set<uint32> g_SocialFriendsList;
 
 static bool IsPlayerRandomBot(Player* player)
 {
@@ -182,32 +268,23 @@ static bool IsHumanPlayer(Player* player)
 static void LoadSocialFriendList()
 {
     g_SocialFriendsList.clear();
-    QueryResult result = CharacterDatabase.Query("SELECT friend FROM character_social WHERE flags = 1");
+    // character_social.friend is the low GUID (SocialMgr writes friendGuid.GetCounter(),
+    // SocialMgr.cpp). Test the friend bit instead of the sign/width of the flags column.
+    QueryResult result = CharacterDatabase.Query(
+        "SELECT friend FROM character_social WHERE (flags & {}) <> 0", uint32(SOCIAL_FLAG_FRIEND));
     if (!result)
     {
         return;
     }
     do
     {
-        g_SocialFriendsList.push_back(result->Fetch()->Get<uint32>());
+        g_SocialFriendsList.insert(result->Fetch()->Get<uint32>());
     } while (result->NextRow());
 }
 
 static bool BotInFriendList(Player* bot)
 {
-    if (!bot)
-    {
-        return false;
-    }
-    uint64 raw = bot->GetGUID().GetRawValue();
-    for (uint64 friendGuid : g_SocialFriendsList)
-    {
-        if (friendGuid == raw)
-        {
-            return true;
-        }
-    }
-    return false;
+    return bot && g_SocialFriendsList.count(LowGuidValue(bot)) > 0;
 }
 
 static bool BotInArenaTeam(Player* bot)
@@ -233,8 +310,9 @@ static bool BotNameExcluded(Player* bot)
         return false;
     }
     std::string name = bot->GetName();
-    std::transform(name.begin(), name.end(), name.begin(), ::tolower);
-    return std::find(g_ExcludeBotNames.begin(), g_ExcludeBotNames.end(), name) != g_ExcludeBotNames.end();
+    std::transform(name.begin(), name.end(), name.begin(),
+                   [](unsigned char c) { return static_cast<char>(::tolower(c)); });
+    return g_ExcludeBotNames.count(name) > 0;
 }
 
 // ---- Real-player accounts / guild cache --------------------------------------
@@ -243,7 +321,7 @@ static std::unordered_set<uint32> g_RealPlayerGuildIds;
 // Builds a comma-separated list of account ids that are NOT random-bot accounts
 // (username does not start with the configured prefix). Returns false if the
 // prefix is empty or there are no such accounts.
-static bool GetRealPlayerAccountIds(std::string& accountIdsOut)
+static bool GetRealPlayerAccountIds(std::vector<uint32>& accountIdsOut)
 {
     accountIdsOut.clear();
     if (g_RandomBotAccountPrefix.empty())
@@ -252,9 +330,10 @@ static bool GetRealPlayerAccountIds(std::string& accountIdsOut)
         return false;
     }
 
-    uint32 prefixLength = static_cast<uint32>(g_RandomBotAccountPrefix.size());
-    std::string prefix = g_RandomBotAccountPrefix;
-    LoginDatabase.EscapeString(prefix);
+    // LEFT() counts characters of the stored username, so the length is the raw prefix
+    // length; the escaped form is only used for the literal comparison below.
+    uint32 const prefixLength = static_cast<uint32>(g_RandomBotAccountPrefix.size());
+    std::string const prefix = LoginDatabase.EscapeString(g_RandomBotAccountPrefix);
 
     QueryResult result = LoginDatabase.Query("SELECT id FROM account WHERE LEFT(username, {}) <> '{}'", prefixLength, prefix);
     if (!result)
@@ -263,14 +342,33 @@ static bool GetRealPlayerAccountIds(std::string& accountIdsOut)
     }
     do
     {
-        if (!accountIdsOut.empty())
-        {
-            accountIdsOut += ',';
-        }
-        accountIdsOut += std::to_string(result->Fetch()->Get<uint32>());
+        accountIdsOut.push_back(result->Fetch()->Get<uint32>());
     } while (result->NextRow());
 
     return !accountIdsOut.empty();
+}
+
+// Runs `body` with a parameter list of at most 1000 account ids per query, so a large realm
+// cannot build one IN(...) string big enough to hit max_allowed_packet or the query length cap.
+// The ids do not repeat across chunks, so callers can accumulate results without de-duping.
+template <typename Body>
+static void ForEachAccountIdChunk(std::vector<uint32> const& accountIds, Body&& body)
+{
+    constexpr size_t chunkSize = 1000;
+    for (size_t start = 0; start < accountIds.size(); start += chunkSize)
+    {
+        size_t const stop = std::min(start + chunkSize, accountIds.size());
+        std::string chunk;
+        for (size_t i = start; i < stop; ++i)
+        {
+            if (!chunk.empty())
+            {
+                chunk += ',';
+            }
+            chunk += std::to_string(accountIds[i]);
+        }
+        body(chunk);
+    }
 }
 
 // Rebuilds the set of guild ids that have at least one real-player member
@@ -278,25 +376,27 @@ static bool GetRealPlayerAccountIds(std::string& accountIdsOut)
 static void RefreshRealPlayerGuildCache()
 {
     g_RealPlayerGuildIds.clear();
-
-    std::string accountIds;
+    std::vector<uint32> accountIds;
     if (!GetRealPlayerAccountIds(accountIds))
     {
         return;
     }
 
-    QueryResult result = CharacterDatabase.Query(
-        "SELECT DISTINCT gm.guildid FROM guild_member gm "
-        "JOIN characters c ON c.guid = gm.guid WHERE c.account IN ({})",
-        accountIds);
-    if (!result)
+    ForEachAccountIdChunk(accountIds, [](std::string const& chunk)
     {
-        return;
-    }
-    do
-    {
-        g_RealPlayerGuildIds.insert(result->Fetch()->Get<uint32>());
-    } while (result->NextRow());
+        QueryResult result = CharacterDatabase.Query(
+            "SELECT DISTINCT gm.guildid FROM guild_member gm "
+            "JOIN characters c ON c.guid = gm.guid WHERE c.account IN ({})",
+            chunk);
+        if (!result)
+        {
+            return;
+        }
+        do
+        {
+            g_RealPlayerGuildIds.insert(result->Fetch()->Get<uint32>());
+        } while (result->NextRow());
+    });
 
     if (g_FullDebug || g_LiteDebug)
     {
@@ -318,49 +418,71 @@ static bool BotInRealPlayerGuild(Player* bot)
 // Sticky for the session: once unlocked, never re-locks.
 static bool g_DkUnlocked = false;
 
+// Whether the gate has been applied with the current g_DkProgressionEnabled value, so the
+// per-login scan is skipped while the gate is already known to be satisfied.
+static bool g_DkApplied = false;
+
 static void EvaluateDeathKnightGate()
 {
+    // Capture mod-playerbots' own setting on the first call, before this module ever writes
+    // to it, so "off" restores the configured value rather than a stale override.
+    if (!g_OriginalDkCaptured)
+    {
+        g_OriginalDisableDkLogin = sPlayerbotAIConfig.DisableDeathKnightLogin;
+        g_OriginalDkCaptured = true;
+    }
+
+    // Switching the feature off (e.g. `.rndbotsync reload`) must give mod-playerbots its own
+    // setting back, not leave this module's override latched in for the rest of the session.
+    // The first capture happens above, where the module has not written the field yet, so the
+    // restored value is the configured one.
     if (!g_DkProgressionEnabled)
     {
-        return; // Leave mod-playerbots' own DisableDeathKnightLogin setting alone.
+        g_DkUnlocked = false;
+        sPlayerbotAIConfig.DisableDeathKnightLogin = g_OriginalDisableDkLogin;
+        return;
     }
 
     if (g_DkUnlocked)
     {
-        sPlayerbotAIConfig.disableDeathKnightLogin = false;
+        sPlayerbotAIConfig.DisableDeathKnightLogin = false;
         return;
     }
 
-    std::string accountIds;
+    std::vector<uint32> accountIds;
     if (!GetRealPlayerAccountIds(accountIds))
     {
-        sPlayerbotAIConfig.disableDeathKnightLogin = true;
+        sPlayerbotAIConfig.DisableDeathKnightLogin = true;
         return;
     }
 
-    uint32 requiredQuest = 66000 + g_DkRequiredState;
-    QueryResult result = CharacterDatabase.Query(
-        "SELECT 1 FROM character_queststatus_rewarded qr "
-        "JOIN characters c ON c.guid = qr.guid "
-        "WHERE qr.quest = {} AND c.account IN ({}) LIMIT 1",
-        requiredQuest, accountIds);
-
-    if (result)
+    uint32 const requiredQuest = 66000 + g_DkRequiredState;
+    for (uint32 const accountId : accountIds)
     {
-        g_DkUnlocked = true;
-        sPlayerbotAIConfig.disableDeathKnightLogin = false;
+        // One account per query: this gate runs on a single login, so it costs at most one
+        // row fetch per real account and cannot build a huge IN(...) list.
+        if (CharacterDatabase.Query(
+                "SELECT 1 FROM character_queststatus_rewarded qr "
+                "JOIN characters c ON c.guid = qr.guid "
+                "WHERE qr.quest = {} AND c.account = {} LIMIT 1", requiredQuest, accountId))
+        {
+            g_DkUnlocked = true;
+            break;
+        }
+    }
+
+    sPlayerbotAIConfig.DisableDeathKnightLogin = !g_DkUnlocked;
+
+    if (g_DkUnlocked)
+    {
         if (g_FullDebug || g_LiteDebug)
         {
             LOG_INFO("server.loading", "[RndBotSync] DK gate met (state {}); Death Knight bots unlocked.", g_DkRequiredState);
         }
     }
-    else
+    else if (g_FullDebug)
     {
-        sPlayerbotAIConfig.disableDeathKnightLogin = true;
-        if (g_FullDebug)
-        {
-            LOG_INFO("server.loading", "[RndBotSync] DK gate not met (state {}); Death Knight bots blocked.", g_DkRequiredState);
-        }
+        LOG_INFO("server.loading", "[RndBotSync] DK gate not met (state {}); Death Knight bots blocked.", g_DkRequiredState);
     }
 }
 
@@ -469,7 +591,7 @@ static uint32 GetBestOwnedItemLevel(Player* player)
 
 // Sets or restores the global gear-score cap so mod-playerbots caps all bot gear
 // (default bot init and re-randomize) at the target player's item level. Same
-// runtime-override pattern as the DK feature's disableDeathKnightLogin.
+// runtime-override pattern as the DK feature's DisableDeathKnightLogin.
 static void UpdateGlobalGearCap(Player* targetPlayer)
 {
     if (!g_IlvlSyncEnabled || !targetPlayer)
@@ -639,6 +761,13 @@ static bool MoveBotToPlayerZone(Player* bot, Player* targetPlayer, uint32 zoneId
     {
         return false;
     }
+    // Teleport first: TeleportTo can refuse (disabled map, expansion, invalid coords), and
+    // clearing the motion master / resetting the AI before a refusal would leave an idle bot.
+    if (!bot->TeleportTo(map->GetId(), pos.GetPositionX(), pos.GetPositionY(), pos.GetPositionZ(),
+                         targetPlayer->GetOrientation()))
+    {
+        return false;
+    }
     // shortcut: a bot in a phase the player is not in lands invisibly in the same zone;
     // open-world random bots are unphased, so only fix this if phased zones become common.
     bot->GetMotionMaster()->Clear();
@@ -647,11 +776,6 @@ static bool MoveBotToPlayerZone(Player* bot, Player* targetPlayer, uint32 zoneId
         botAI->Reset(true);
     }
     bot->RemoveAurasWithInterruptFlags(AURA_INTERRUPT_FLAG_TELEPORTED | AURA_INTERRUPT_FLAG_CHANGE_MAP);
-    if (!bot->TeleportTo(map->GetId(), pos.GetPositionX(), pos.GetPositionY(), pos.GetPositionZ(),
-                         targetPlayer->GetOrientation()))
-    {
-        return false;
-    }
     bot->SendMovementFlagUpdate();
 
     // mod-playerbots re-teleports every random bot on its own long timer; push that back so
@@ -726,7 +850,182 @@ static bool SetBotLevelInRange(Player* bot, int lower, int upper)
     return true;
 }
 
-static void RunAdjustmentPass(bool unlimitedBudget = false)
+// ---- Adjustment pass ---------------------------------------------------------
+
+// ---- Adjustment pass ---------------------------------------------------------
+
+// Enforces the ceiling: pulls bots above it down. Returns the number changed.
+static uint32 DownlevelAboveCeiling(std::vector<Player*> const& eligible, int bandLower, int ceiling,
+                                    bool unlimited, uint32& budget)
+{
+    std::vector<Player*> aboveCeiling;
+    for (Player* bot : eligible)
+    {
+        if (static_cast<int>(bot->GetLevel()) > ceiling)
+        {
+            aboveCeiling.push_back(bot);
+        }
+    }
+
+    // Highest first: bring the most out-of-place bots down first.
+    std::sort(aboveCeiling.begin(), aboveCeiling.end(), [](Player* a, Player* b)
+    {
+        return a->GetLevel() > b->GetLevel();
+    });
+
+    uint32 changed = 0;
+    for (Player* bot : aboveCeiling)
+    {
+        if (!unlimited && budget == 0)
+        {
+            break;
+        }
+        // Scatter across [RandomBotMinLevel, ceiling] to keep a level spread. A bot the
+        // player deliberately guilded is a companion, not filler: keep it in the band instead
+        // (only reachable with IgnoreGuildBotsWithRealPlayers = 0). Unsafe bots (combat,
+        // instance, flight, ...) are skipped without spending budget.
+        int const lower = BotInRealPlayerGuild(bot) ? bandLower : static_cast<int>(g_RandomBotMinLevel);
+        if (SetBotLevelInRange(bot, lower, ceiling))
+        {
+            ++changed;
+            if (!unlimited)
+            {
+                --budget;
+            }
+        }
+    }
+    return changed;
+}
+
+// Concentrates about TargetPercent% of the population inside the band by raising the
+// lowest-level bots into it. Returns the number changed.
+static uint32 PromoteIntoBand(std::vector<Player*> const& eligible, int bandLower, int ceiling,
+                              uint32 desiredNear, bool unlimited, uint32& budget)
+{
+    uint32 currentNear = 0;
+    std::vector<Player*> belowBand;
+    for (Player* bot : eligible)
+    {
+        int const level = static_cast<int>(bot->GetLevel());
+        if (level >= bandLower && level <= ceiling)
+        {
+            ++currentNear;
+        }
+        else if (level < bandLower)
+        {
+            belowBand.push_back(bot);
+        }
+    }
+
+    if (currentNear >= desiredNear)
+    {
+        return 0;
+    }
+
+    uint32 need = desiredNear - currentNear;
+
+    // Lowest-level first, so the population moves upward into the band.
+    std::sort(belowBand.begin(), belowBand.end(), [](Player* a, Player* b)
+    {
+        return a->GetLevel() < b->GetLevel();
+    });
+
+    uint32 changed = 0;
+    for (Player* bot : belowBand)
+    {
+        if (need == 0 || (!unlimited && budget == 0))
+        {
+            break;
+        }
+        // Unsafe bots are skipped without spending budget or the deficit.
+        if (SetBotLevelInRange(bot, bandLower, ceiling))
+        {
+            ++changed;
+            --need;
+            if (!unlimited)
+            {
+                --budget;
+            }
+        }
+    }
+    return changed;
+}
+
+// Moves the nearest bots standing outside the target zone onto a teleport location inside it.
+// Returns the number moved.
+static uint32 GatherIntoZone(std::vector<Player*> const& eligible, Player* targetPlayer, uint32 zoneId,
+                             uint32 desiredNear, bool unlimited, uint32& areaBudget)
+{
+    uint32 currentNear = 0;
+    std::vector<Player*> outsideZone;
+    for (Player* bot : eligible)
+    {
+        if (bot->GetMapId() == targetPlayer->GetMapId() && bot->GetZoneId() == zoneId)
+        {
+            ++currentNear;
+        }
+        else
+        {
+            outsideZone.push_back(bot);
+        }
+    }
+
+    if (currentNear >= desiredNear)
+    {
+        return 0;
+    }
+
+    uint32 need = desiredNear - currentNear;
+
+    // Nearest first: the bots already in the general region converge before the ones on the
+    // other side of the world, so the local population grows visibly.
+    std::sort(outsideZone.begin(), outsideZone.end(), [&](Player* a, Player* b)
+    {
+        bool const sameMapA = a->GetMapId() == targetPlayer->GetMapId();
+        bool const sameMapB = b->GetMapId() == targetPlayer->GetMapId();
+        if (sameMapA != sameMapB)
+        {
+            return sameMapA;
+        }
+        if (!sameMapA)
+        {
+            return false;
+        }
+        return a->GetExactDist(targetPlayer) < b->GetExactDist(targetPlayer);
+    });
+
+    uint32 changed = 0;
+    for (Player* bot : outsideZone)
+    {
+        if (need == 0 || (!unlimited && areaBudget == 0))
+        {
+            break;
+        }
+        // Unsafe, unreachable or zone-less bots are skipped without spending budget or the deficit.
+        if (MoveBotToPlayerZone(bot, targetPlayer, zoneId))
+        {
+            ++changed;
+            --need;
+            if (!unlimited)
+            {
+                --areaBudget;
+            }
+        }
+    }
+    return changed;
+}
+
+// Which part of the pass a call performs. The world timer alternates Level and Area across
+// the check interval; a login, a level-up or the resync command runs the full pass.
+enum class PassPart
+{
+    Full,   // level steps + area step
+    Level,  // downlevel + promote only
+    Area    // zone gathering only
+};
+
+// One adjustment pass. `part` selects which steps run; `unlimitedBudget` ignores ProcessLimit.
+static void RunAdjustmentPass(bool unlimitedBudget = false, PassPart part = PassPart::Full)
 {
     if (!g_Enabled)
     {
@@ -734,232 +1033,84 @@ static void RunAdjustmentPass(bool unlimitedBudget = false)
     }
 
     int target = -1;
-    Player* targetPlayer = nullptr;
-    std::vector<Player*> eligible;
+    Player* const targetPlayer = FindTargetPlayer(target);
 
-    auto const& players = ObjectAccessor::GetPlayers();
-    for (auto const& itr : players)
-    {
-        Player* player = itr.second;
-        if (!player || !player->IsInWorld())
-        {
-            continue;
-        }
-
-        if (IsHumanPlayer(player))
-        {
-            // Real player: highest-level one is the target.
-            if (static_cast<int>(player->GetLevel()) > target)
-            {
-                target = static_cast<int>(player->GetLevel());
-                targetPlayer = player;
-            }
-            continue;
-        }
-
-        if (!IsPlayerRandomBot(player) || IsBotExcluded(player))
-        {
-            continue;
-        }
-        eligible.push_back(player);
-    }
-
-    // Item level sync: set the gear cap from the target player (or restore the
-    // original when none online). Independent of the level-adjustment steps.
+    // Item level sync: set the gear cap from the target player (or restore the original when
+    // none online). Independent of the level-adjustment steps, so it also runs for an area-only
+    // pass.
     UpdateGlobalGearCap(targetPlayer);
 
     if (target < 0)
     {
         return; // No real player online: freeze.
     }
-    if (g_TargetPercent == 0 && !g_AllowDownleveling)
+
+    // The band's upper edge is the ceiling: the highest real player's level plus the band,
+    // treated as the effective maximum for the whole bot population.
+    int bandLower = 0;
+    int ceiling = 0;
+    ComputeLevelBand(target, bandLower, ceiling);
+
+    // Zone the pass gathers into: resolved once so the whole pass targets one zone.
+    uint32 const areaZone = g_AreaSyncEnabled ? ResolveAreaSyncZone(targetPlayer) : 0;
+
+    bool const levelsWanted = (part != PassPart::Area) &&
+                              (g_TargetPercent > 0 || g_AllowDownleveling);
+    bool const areaWanted = (part != PassPart::Level) && g_AreaSyncEnabled && areaZone != 0;
+    if (!levelsWanted && !areaWanted)
     {
-        return; // Level adjustment disabled; gear cap already handled above.
+        return;
     }
+
+    // One scan: the level steps and the zone step need the same population.
+    std::vector<Player*> const eligible = CollectEligibleBots();
     if (eligible.empty())
     {
         return;
     }
 
-    // The band's upper edge is the ceiling: the highest real player's level plus
-    // the band, treated as the effective maximum for the whole bot population.
-    uint32 maxLevel = sWorld->getIntConfig(CONFIG_MAX_PLAYER_LEVEL);
-    int bandLower = target - static_cast<int>(g_TargetBand);
-    if (bandLower < static_cast<int>(g_RandomBotMinLevel))
+    bool const unlimited = unlimitedBudget || (g_ProcessLimit == 0);
+    uint32 desiredNear = static_cast<uint32>(std::lround(g_TargetPercent / 100.0 * eligible.size()));
+
+    // Split the finite pass so neither the level steps nor the zone step can starve the other:
+    // while bots below the band are plentiful, promotion alone would spend every slot. A pass
+    // that runs only one kind of step gets the whole budget for it. When ProcessLimit is 1 there
+    // is nothing to split without overspending, so the level steps keep it. ProcessLimit 0 (or
+    // resync) means unlimited everywhere, and the budgets below are then never consulted.
+    uint32 budget = 0;
+    uint32 areaBudget = 0;
+    if (!unlimited)
     {
-        bandLower = g_RandomBotMinLevel;
-    }
-    int ceiling = target + static_cast<int>(g_TargetBand);
-    if (ceiling > static_cast<int>(maxLevel))
-    {
-        ceiling = static_cast<int>(maxLevel);
+        if (levelsWanted && areaWanted && g_ProcessLimit >= 2)
+        {
+            areaBudget = g_ProcessLimit / 2;
+            budget = g_ProcessLimit - areaBudget;
+        }
+        else if (levelsWanted)
+        {
+            budget = g_ProcessLimit;
+        }
+        else
+        {
+            areaBudget = g_ProcessLimit;
+        }
     }
 
-    bool const unlimited = unlimitedBudget || (g_ProcessLimit == 0);
-    // Split the finite pass so area gathering cannot be starved by level promotion: while
-    // bots below the band are plentiful, promotion alone would spend every slot. ProcessLimit
-    // 0 (or resync) still means unlimited everywhere.
-    uint32 const areaShare = (g_AreaSyncEnabled && !unlimited && g_ProcessLimit >= 2) ? g_ProcessLimit / 2 : 0;
-    uint32 budget = g_AreaSyncEnabled && !unlimited ? g_ProcessLimit - areaShare : g_ProcessLimit;
-    uint32 areaBudget = areaShare;
     uint32 downleveled = 0;
     uint32 promoted = 0;
     uint32 moved = 0;
 
-    // ---- Step 1: enforce the ceiling (downlevel bots above it) ----
-    if (g_AllowDownleveling)
+    if (levelsWanted && g_AllowDownleveling)
     {
-        std::vector<Player*> aboveCeiling;
-        for (Player* bot : eligible)
-        {
-            if (static_cast<int>(bot->GetLevel()) > ceiling)
-            {
-                aboveCeiling.push_back(bot);
-            }
-        }
-        // Highest first: bring the most out-of-place bots down first.
-        std::sort(aboveCeiling.begin(), aboveCeiling.end(), [](Player* a, Player* b)
-        {
-            return a->GetLevel() > b->GetLevel();
-        });
-        for (Player* bot : aboveCeiling)
-        {
-            if (!unlimited && budget == 0)
-            {
-                break;
-            }
-            // Scatter across [RandomBotMinLevel, ceiling] to keep a level spread.
-            // A bot the player deliberately guilded is a companion, not filler:
-            // keep it in the band instead (only reachable with
-            // IgnoreGuildBotsWithRealPlayers = 0). Unsafe bots (combat,
-            // instance, flight, ...) are skipped without spending budget.
-            int const lower = BotInRealPlayerGuild(bot) ? bandLower : static_cast<int>(g_RandomBotMinLevel);
-            if (SetBotLevelInRange(bot, lower, ceiling))
-            {
-                ++downleveled;
-                if (!unlimited)
-                {
-                    --budget;
-                }
-            }
-        }
+        downleveled = DownlevelAboveCeiling(eligible, bandLower, ceiling, unlimited, budget);
     }
-
-    // ---- Step 2: concentrate TargetPercent% inside the band (promote up) ----
-    if (g_TargetPercent > 0 && (unlimited || budget > 0))
+    if (levelsWanted && g_TargetPercent > 0 && (unlimited || budget > 0))
     {
-        uint32 desiredNear = static_cast<uint32>(std::lround(g_TargetPercent / 100.0 * eligible.size()));
-
-        uint32 currentNear = 0;
-        std::vector<Player*> belowBand;
-        for (Player* bot : eligible)
-        {
-            int level = static_cast<int>(bot->GetLevel());
-            if (level >= bandLower && level <= ceiling)
-            {
-                ++currentNear;
-            }
-            else if (level < bandLower)
-            {
-                belowBand.push_back(bot);
-            }
-        }
-
-        if (currentNear < desiredNear)
-        {
-            uint32 need = desiredNear - currentNear;
-
-            // Lowest-level first, so the population moves upward into the band.
-            std::sort(belowBand.begin(), belowBand.end(), [](Player* a, Player* b)
-            {
-                return a->GetLevel() < b->GetLevel();
-            });
-
-            for (Player* bot : belowBand)
-            {
-                if (need == 0 || (!unlimited && budget == 0))
-                {
-                    break;
-                }
-                // Unsafe bots are skipped without spending budget or the deficit.
-                if (SetBotLevelInRange(bot, bandLower, ceiling))
-                {
-                    ++promoted;
-                    --need;
-                    if (!unlimited)
-                    {
-                        --budget;
-                    }
-                }
-            }
-        }
+        promoted = PromoteIntoBand(eligible, bandLower, ceiling, desiredNear, unlimited, budget);
     }
-
-    // ---- Step 3: gather the stragglers into the player's zone ----
-    // Same target share as the level band: about TargetPercent% of eligible bots end up in
-    // the player's zone (one zone id for the whole pass, see ResolveAreaSyncZone). Bots
-    // already in it are never moved, so bots still logging in simply get caught on a later
-    // pass. Uses its own slice of the pass (see areaShare).
-    uint32 const areaZone = g_AreaSyncEnabled ? ResolveAreaSyncZone(targetPlayer) : 0;
-
-    if (areaZone && (unlimited || areaBudget > 0))
+    if (areaWanted && (unlimited || areaBudget > 0))
     {
-        uint32 desiredNear = static_cast<uint32>(std::lround(g_TargetPercent / 100.0 * eligible.size()));
-
-        uint32 currentNear = 0;
-        std::vector<Player*> outsideZone;
-        for (Player* bot : eligible)
-        {
-            if (bot->GetMapId() == targetPlayer->GetMapId() && bot->GetZoneId() == areaZone)
-            {
-                ++currentNear;
-            }
-            else
-            {
-                outsideZone.push_back(bot);
-            }
-        }
-
-        if (currentNear < desiredNear)
-        {
-            uint32 need = desiredNear - currentNear;
-
-            // Nearest first: the bots already in the general region converge before the
-            // ones on the other side of the world, so the local population grows visibly.
-            std::sort(outsideZone.begin(), outsideZone.end(), [&](Player* a, Player* b)
-            {
-                bool const sameMapA = a->GetMapId() == targetPlayer->GetMapId();
-                bool const sameMapB = b->GetMapId() == targetPlayer->GetMapId();
-                if (sameMapA != sameMapB)
-                {
-                    return sameMapA;
-                }
-                if (!sameMapA)
-                {
-                    return false;
-                }
-                return a->GetExactDist(targetPlayer) < b->GetExactDist(targetPlayer);
-            });
-
-            for (Player* bot : outsideZone)
-            {
-                if (need == 0 || (!unlimited && areaBudget == 0))
-                {
-                    break;
-                }
-                // Unsafe, unreachable or zone-less bots are skipped without spending budget
-                // or the deficit.
-                if (MoveBotToPlayerZone(bot, targetPlayer, areaZone))
-                {
-                    ++moved;
-                    --need;
-                    if (!unlimited)
-                    {
-                        --areaBudget;
-                    }
-                }
-            }
-        }
+        moved = GatherIntoZone(eligible, targetPlayer, areaZone, desiredNear, unlimited, areaBudget);
     }
 
     if ((g_FullDebug || g_LiteDebug) && (downleveled > 0 || promoted > 0 || moved > 0))
@@ -993,6 +1144,7 @@ public:
         }
         RefreshCaches();
         EvaluateDeathKnightGate();
+        g_DkApplied = g_DkProgressionEnabled;
         LOG_INFO("server.loading",
                  "[RndBotSync] Loaded. CheckFrequency {}s, TargetPercent {}%, TargetBand +/-, AreaSync {} (zone {}).",
                  g_CheckFrequency, g_TargetPercent, g_TargetBand, g_AreaSyncEnabled,
@@ -1006,14 +1158,21 @@ public:
             return;
         }
 
+        // Periods are clamped at load, so the millisecond products cannot overflow. The two
+        // timers are deliberately out of phase: the (expensive) cache scan and the pass that
+        // moves bots never fire in the same tick, so a pass always measures a fresh cache.
+        uint64 const guildPeriod = static_cast<uint64>(g_GuildCacheRefreshFrequency) * 1000;
         m_guildTimer += diff;
-        if (m_guildTimer >= g_GuildCacheRefreshFrequency * 1000)
+        if (m_guildTimer >= guildPeriod)
         {
-            m_guildTimer = 0;
+            // Carry the sub-period remainder instead of dropping it, so the effective
+            // interval does not drift. Only the scan runs here, never a pass.
+            m_guildTimer %= guildPeriod;
             RefreshCaches();
-            if (g_DkProgressionEnabled && !g_DkUnlocked)
+            if (g_DkProgressionEnabled != g_DkApplied)
             {
                 EvaluateDeathKnightGate();
+                g_DkApplied = g_DkProgressionEnabled;
             }
         }
 
@@ -1021,17 +1180,22 @@ public:
         {
             return; // Events-only mode.
         }
+        uint64 const checkPeriod = static_cast<uint64>(g_CheckFrequency) * 1000;
         m_timer += diff;
-        if (m_timer >= g_CheckFrequency * 1000)
+        if (m_timer >= checkPeriod)
         {
-            m_timer = 0;
-            RunAdjustmentPass();
+            m_timer %= checkPeriod;
+            // Phase by wall clock rather than by stored state, so a reload cannot invert it.
+            // g_CheckFrequency is >= 1 after clamping, so the modulo is always defined.
+            bool const scanTick = (static_cast<uint32>(GameTime::GetGameTime().count()) % g_CheckFrequency) <
+                                  (g_CheckFrequency / 2);
+            RunAdjustmentPass(false, scanTick ? PassPart::Level : PassPart::Area);
         }
     }
 
 private:
-    uint32 m_timer;
-    uint32 m_guildTimer;
+    uint64 m_timer;
+    uint64 m_guildTimer;
 };
 
 // ---- PlayerScript ------------------------------------------------------------
@@ -1049,6 +1213,7 @@ public:
         if (g_DkProgressionEnabled && !g_DkUnlocked)
         {
             EvaluateDeathKnightGate();
+            g_DkApplied = g_DkProgressionEnabled;
         }
         RunAdjustmentPass();
     }
@@ -1085,6 +1250,7 @@ public:
         LoadConfig();
         RefreshCaches();
         EvaluateDeathKnightGate();
+        g_DkApplied = g_DkProgressionEnabled;
         UpdateGlobalGearCap(nullptr);
         handler->SendSysMessage("[RndBotSync] Config reloaded.");
         return true;
@@ -1095,22 +1261,7 @@ public:
     static bool HandleStatus(ChatHandler* handler)
     {
         int target = -1;
-        Player* targetPlayer = nullptr;
-
-        auto const& players = ObjectAccessor::GetPlayers();
-        for (auto const& itr : players)
-        {
-            Player* player = itr.second;
-            if (!player || !player->IsInWorld())
-            {
-                continue;
-            }
-            if (IsHumanPlayer(player) && static_cast<int>(player->GetLevel()) > target)
-            {
-                target = static_cast<int>(player->GetLevel());
-                targetPlayer = player;
-            }
-        }
+        Player* const targetPlayer = FindTargetPlayer(target);
 
         handler->PSendSysMessage("[RndBotSync] Enabled: {}, CheckFrequency: {}s, ProcessLimit: {}.",
                                  g_Enabled, g_CheckFrequency, g_ProcessLimit);
@@ -1121,25 +1272,17 @@ public:
         }
         else
         {
-            uint32 maxLevel = sWorld->getIntConfig(CONFIG_MAX_PLAYER_LEVEL);
-            int bandLower = std::max(static_cast<int>(g_RandomBotMinLevel), target - static_cast<int>(g_TargetBand));
-            int ceiling = std::min(static_cast<int>(maxLevel), target + static_cast<int>(g_TargetBand));
+            int bandLower = 0;
+            int ceiling = 0;
+            ComputeLevelBand(target, bandLower, ceiling);
 
-            uint32 eligible = 0, inBand = 0, aboveCeiling = 0, belowBand = 0, inArea = 0;
             uint32 const botZone = ResolveAreaSyncZone(targetPlayer);
-            for (auto const& itr : players)
+            std::vector<Player*> const eligibleBots = CollectEligibleBots();
+
+            uint32 inBand = 0, aboveCeiling = 0, belowBand = 0, inArea = 0;
+            for (Player* bot : eligibleBots)
             {
-                Player* bot = itr.second;
-                if (!bot || !bot->IsInWorld() || IsHumanPlayer(bot))
-                {
-                    continue;
-                }
-                if (!IsPlayerRandomBot(bot) || IsBotExcluded(bot))
-                {
-                    continue;
-                }
-                ++eligible;
-                int level = static_cast<int>(bot->GetLevel());
+                int const level = static_cast<int>(bot->GetLevel());
                 if (g_AreaSyncEnabled && botZone && bot->GetMapId() == targetPlayer->GetMapId() &&
                     bot->GetZoneId() == botZone)
                 {
@@ -1158,7 +1301,9 @@ public:
                     ++inBand;
                 }
             }
-            uint32 desiredNear = static_cast<uint32>(std::lround(g_TargetPercent / 100.0 * eligible));
+
+            uint32 const eligible = static_cast<uint32>(eligibleBots.size());
+            uint32 const desiredNear = static_cast<uint32>(std::lround(g_TargetPercent / 100.0 * eligible));
 
             handler->PSendSysMessage("  Target: {} (level {}).", targetPlayer->GetName(), target);
             handler->PSendSysMessage("  Band: [{}-{}] (ceiling {}), TargetPercent {} -> desired in-band {}.",
@@ -1186,6 +1331,7 @@ public:
     {
         RefreshCaches();
         EvaluateDeathKnightGate();
+        g_DkApplied = g_DkProgressionEnabled;
         RunAdjustmentPass(true);
         handler->SendSysMessage("[RndBotSync] Forced full resync complete.");
         return true;

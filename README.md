@@ -138,8 +138,10 @@ Around it sits a **band** of `±TargetBand` levels; the top of that band is the
    already there are never touched, so the world converges over successive passes.
 
 Passes run on real-player login and level-up, plus the safety timer. The
-`ProcessLimit` spreads large corrections over several passes so nothing happens
-in a single laggy burst.
+`safety timer` alternates between the level steps and the zone step, so a pass never
+re-does the work the previous pass just did. The `ProcessLimit` spreads large corrections
+over several passes so nothing happens in a single laggy burst; when area sync is on, half
+of that budget belongs to the zone step so level promotion cannot starve it.
 
 ## Credits
 
