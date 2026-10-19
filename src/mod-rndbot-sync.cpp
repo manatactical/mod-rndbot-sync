@@ -333,7 +333,8 @@ static bool GetRealPlayerAccountIds(std::vector<uint32>& accountIdsOut)
     // LEFT() counts characters of the stored username, so the length is the raw prefix
     // length; the escaped form is only used for the literal comparison below.
     uint32 const prefixLength = static_cast<uint32>(g_RandomBotAccountPrefix.size());
-    std::string const prefix = LoginDatabase.EscapeString(g_RandomBotAccountPrefix);
+    std::string prefix = g_RandomBotAccountPrefix;
+    LoginDatabase.EscapeString(prefix); // in-place, returns void
 
     QueryResult result = LoginDatabase.Query("SELECT id FROM account WHERE LEFT(username, {}) <> '{}'", prefixLength, prefix);
     if (!result)
