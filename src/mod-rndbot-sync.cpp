@@ -28,6 +28,7 @@
 #include "Player.h"
 #include "WorldSession.h"
 #include "ObjectAccessor.h"
+#include "Map.h"
 #include "DatabaseEnv.h"
 #include "QueryResult.h"
 #include "ArenaTeamMgr.h"
@@ -40,6 +41,8 @@
 #include "RandomPlayerbotMgr.h"
 #include "PlayerbotAIConfig.h"
 #include "PlayerbotFactory.h"
+#include "TravelMgr.h"
+#include "Group.h"
 #include "Item.h"
 #include "Bag.h"
 #include "ItemTemplate.h"
@@ -74,6 +77,21 @@ static bool   g_FullDebug = false;
 static bool   g_LiteDebug = false;
 static bool  g_IlvlSyncEnabled = true;      // cap bot gear at the player's ilvl
 static int32 g_OriginalGearScoreLimit = 0;  // configured AiPlayerbot.RandomGearScoreLimit
+static bool   g_AreaSyncEnabled = true;     // gather bots into the player's zone
+static uint32 g_AreaSyncZone = 0;           // fixed zone id; 0 = follow the player's zone
+static bool   g_AreaSyncUsePlayerZone = true; // true = use the player's current zone id
+
+// Zone the pass should gather bots into: a pinned zone, or the target player's zone.
+// The player's zone is resolved once per pass and reused, so a bot is never moved into
+// a different zone than the one the target player was standing in when the pass ran.
+static uint32 ResolveAreaSyncZone(Player* targetPlayer)
+{
+    if (!g_AreaSyncUsePlayerZone)
+    {
+        return g_AreaSyncZone;
+    }
+    return targetPlayer ? targetPlayer->GetZoneId() : 0;
+}
 
 // Pulled from mod-playerbots config.
 static uint8  g_RandomBotMinLevel = 1;
@@ -96,6 +114,10 @@ static void LoadConfig()
     g_DkProgressionEnabled = sConfigMgr->GetOption<bool>("RndBotSync.DeathKnightProgression.Enabled", false);
     g_DkRequiredState = sConfigMgr->GetOption<uint32>("RndBotSync.DeathKnightProgression.RequiredState", 13);
     g_IlvlSyncEnabled = sConfigMgr->GetOption<bool>("RndBotSync.IlvlSync.Enabled", true);
+    g_AreaSyncEnabled = sConfigMgr->GetOption<bool>("RndBotSync.AreaSync.Enabled", true);
+    uint32 const areaSyncZone = sConfigMgr->GetOption<uint32>("RndBotSync.AreaSync.ZoneId", 0);
+    g_AreaSyncZone = areaSyncZone;
+    g_AreaSyncUsePlayerZone = (areaSyncZone == 0);
     // Read directly from config so it is order-independent of mod-playerbots and
     // reflects the user's configured value (the cap we restore to when off).
     g_OriginalGearScoreLimit = sConfigMgr->GetOption<int32>("AiPlayerbot.RandomGearScoreLimit", 0);
@@ -507,6 +529,143 @@ static bool IsBotSafeToAdjust(Player* bot)
     return true;
 }
 
+// Same guards mod-playerbots applies to its own bot teleports. A map id that is
+// not in Playerbots.RandomBotMaps is refused so area sync cannot undo the admin's
+// own "bots do not go there" list.
+static bool IsBotSafeToTeleport(Player* bot)
+{
+    if (!bot->IsAlive() || bot->IsInCombat() || bot->IsBeingTeleported() || bot->IsRooted())
+    {
+        return false;
+    }
+    if (bot->InBattleground() || bot->InArena() || bot->InBattlegroundQueue() || bot->IsInFlight())
+    {
+        return false;
+    }
+    // In a group, only a bot leading its own group may be moved; otherwise it would
+    // be yanked away from the group it follows.
+    if (bot->GetGroup() && !bot->GetGroup()->IsLeader(bot->GetGUID()))
+    {
+        return false;
+    }
+    return true;
+}
+
+// True if the map is one mod-playerbots itself allows bots to be teleported to.
+static bool BotMapAllowed(uint32 mapId)
+{
+    auto const& maps = sPlayerbotAIConfig.RandomBotMaps;
+    return std::find(maps.begin(), maps.end(), mapId) != maps.end();
+}
+
+// Picks a place in `zoneId` for a bot to land: mod-playerbots' own teleport locations for
+// the bot's level that sit in that zone on the player's map, shuffled so the bots spread
+// out instead of stacking on one spot.
+//
+// shortcut: the level-keyed location cache only covers maps listed in Playerbots.RandomBotMaps;
+// a zone outside that list (a dungeon, a battleground, a map the admin excluded) finds no
+// location and the bot is skipped. Extend with map grid generation if that ever matters.
+static bool FindZoneTeleportPosition(Player* bot, Player* targetPlayer, uint32 zoneId, Position& out)
+{
+    Map* map = targetPlayer->GetMap();
+    uint32 const mapId = map->GetId();
+
+    std::vector<Position> candidates;
+    for (WorldLocation const& loc : sTravelMgr.GetTeleportLocations(bot))
+    {
+        if (loc.GetMapId() != mapId)
+        {
+            continue;
+        }
+        if (map->GetZoneId(PHASEMASK_NORMAL, loc.GetPositionX(), loc.GetPositionY(), loc.GetPositionZ()) != zoneId)
+        {
+            continue;
+        }
+        candidates.emplace_back(loc.GetPositionX(), loc.GetPositionY(), loc.GetPositionZ());
+    }
+
+    if (candidates.empty())
+    {
+        return false;
+    }
+
+    std::shuffle(candidates.begin(), candidates.end(), RandomEngine::Instance());
+
+    // Ground and water checks use the bot's own phase mask, because the bot is the one
+    // landing; a candidate the bot cannot stand on is skipped, not moved to a fallback.
+    for (Position const& pos : candidates)
+    {
+        float const z = map->GetHeight(bot->GetPhaseMask(), pos.GetPositionX(), pos.GetPositionY(), pos.GetPositionZ() + 0.5f);
+        if (z <= INVALID_HEIGHT ||
+            map->IsInWater(bot->GetPhaseMask(), pos.GetPositionX(), pos.GetPositionY(), z, bot->GetCollisionHeight()))
+        {
+            continue;
+        }
+        out.Relocate(pos.GetPositionX(), pos.GetPositionY(), z + 0.05f);
+        return true;
+    }
+
+    return false;
+}
+
+// Teleports a bot into the target player's zone (same zone id, same map) onto one of
+// mod-playerbots' own teleport locations for that zone. Instances are skipped: a
+// WorldLocation carries no instance id, so a bot would land in another instance of the
+// same map. Returns false when the bot is already in the zone or cannot be moved.
+static bool MoveBotToPlayerZone(Player* bot, Player* targetPlayer, uint32 zoneId)
+{
+    if (!zoneId || !bot || !targetPlayer || !bot->IsInWorld() || !bot->GetSession() ||
+        bot->GetSession()->IsLoggingOut() || bot->IsDuringRemoveFromWorld())
+    {
+        return false;
+    }
+
+    Map* map = targetPlayer->GetMap();
+    if (!map || map->Instanceable() || !BotMapAllowed(map->GetId()))
+    {
+        return false;
+    }
+    if (bot->GetMapId() == map->GetId() && bot->GetZoneId() == zoneId)
+    {
+        return false;
+    }
+    if (!IsBotSafeToTeleport(bot))
+    {
+        return false;
+    }
+
+    Position pos;
+    if (!FindZoneTeleportPosition(bot, targetPlayer, zoneId, pos))
+    {
+        return false;
+    }
+    // shortcut: a bot in a phase the player is not in lands invisibly in the same zone;
+    // open-world random bots are unphased, so only fix this if phased zones become common.
+    bot->GetMotionMaster()->Clear();
+    if (PlayerbotAI* botAI = sPlayerbotsMgr.GetPlayerbotAI(bot))
+    {
+        botAI->Reset(true);
+    }
+    bot->RemoveAurasWithInterruptFlags(AURA_INTERRUPT_FLAG_TELEPORTED | AURA_INTERRUPT_FLAG_CHANGE_MAP);
+    if (!bot->TeleportTo(map->GetId(), pos.GetPositionX(), pos.GetPositionY(), pos.GetPositionZ(),
+                         targetPlayer->GetOrientation()))
+    {
+        return false;
+    }
+    bot->SendMovementFlagUpdate();
+
+    // mod-playerbots re-teleports every random bot on its own long timer; push that back so
+    // the bot does not immediately wander off again.
+    sRandomPlayerbotMgr.ScheduleTeleport(bot->GetGUID().GetCounter(), 1800);
+
+    if (g_FullDebug)
+    {
+        LOG_INFO("server.loading", "[RndBotSync] Moved bot '{}' into zone {} of '{}' (map {}).",
+                 bot->GetName(), zoneId, targetPlayer->GetName(), map->GetId());
+    }
+    return true;
+}
+
 // Sets a single bot's level to a random value in [lower, upper] and re-randomizes
 // gear/stats. Used both to raise (promote) and lower (downlevel) a bot. Death
 // Knights are floored at the heroic start level; if the range is entirely below
@@ -637,9 +796,15 @@ static void RunAdjustmentPass(bool unlimitedBudget = false)
     }
 
     bool const unlimited = unlimitedBudget || (g_ProcessLimit == 0);
-    uint32 budget = g_ProcessLimit;
+    // Split the finite pass so area gathering cannot be starved by level promotion: while
+    // bots below the band are plentiful, promotion alone would spend every slot. ProcessLimit
+    // 0 (or resync) still means unlimited everywhere.
+    uint32 const areaShare = (g_AreaSyncEnabled && !unlimited && g_ProcessLimit >= 2) ? g_ProcessLimit / 2 : 0;
+    uint32 budget = g_AreaSyncEnabled && !unlimited ? g_ProcessLimit - areaShare : g_ProcessLimit;
+    uint32 areaBudget = areaShare;
     uint32 downleveled = 0;
     uint32 promoted = 0;
+    uint32 moved = 0;
 
     // ---- Step 1: enforce the ceiling (downlevel bots above it) ----
     if (g_AllowDownleveling)
@@ -730,10 +895,77 @@ static void RunAdjustmentPass(bool unlimitedBudget = false)
         }
     }
 
-    if ((g_FullDebug || g_LiteDebug) && (downleveled > 0 || promoted > 0))
+    // ---- Step 3: gather the stragglers into the player's zone ----
+    // Same target share as the level band: about TargetPercent% of eligible bots end up in
+    // the player's zone (one zone id for the whole pass, see ResolveAreaSyncZone). Bots
+    // already in it are never moved, so bots still logging in simply get caught on a later
+    // pass. Uses its own slice of the pass (see areaShare).
+    uint32 const areaZone = g_AreaSyncEnabled ? ResolveAreaSyncZone(targetPlayer) : 0;
+
+    if (areaZone && (unlimited || areaBudget > 0))
     {
-        LOG_INFO("server.loading", "[RndBotSync] Target {} band [{}-{}], eligible {}, downleveled {}, promoted {}.",
-                 target, bandLower, ceiling, eligible.size(), downleveled, promoted);
+        uint32 desiredNear = static_cast<uint32>(std::lround(g_TargetPercent / 100.0 * eligible.size()));
+
+        uint32 currentNear = 0;
+        std::vector<Player*> outsideZone;
+        for (Player* bot : eligible)
+        {
+            if (bot->GetMapId() == targetPlayer->GetMapId() && bot->GetZoneId() == areaZone)
+            {
+                ++currentNear;
+            }
+            else
+            {
+                outsideZone.push_back(bot);
+            }
+        }
+
+        if (currentNear < desiredNear)
+        {
+            uint32 need = desiredNear - currentNear;
+
+            // Nearest first: the bots already in the general region converge before the
+            // ones on the other side of the world, so the local population grows visibly.
+            std::sort(outsideZone.begin(), outsideZone.end(), [&](Player* a, Player* b)
+            {
+                bool const sameMapA = a->GetMapId() == targetPlayer->GetMapId();
+                bool const sameMapB = b->GetMapId() == targetPlayer->GetMapId();
+                if (sameMapA != sameMapB)
+                {
+                    return sameMapA;
+                }
+                if (!sameMapA)
+                {
+                    return false;
+                }
+                return a->GetExactDist(targetPlayer) < b->GetExactDist(targetPlayer);
+            });
+
+            for (Player* bot : outsideZone)
+            {
+                if (need == 0 || (!unlimited && areaBudget == 0))
+                {
+                    break;
+                }
+                // Unsafe, unreachable or zone-less bots are skipped without spending budget
+                // or the deficit.
+                if (MoveBotToPlayerZone(bot, targetPlayer, areaZone))
+                {
+                    ++moved;
+                    --need;
+                    if (!unlimited)
+                    {
+                        --areaBudget;
+                    }
+                }
+            }
+        }
+    }
+
+    if ((g_FullDebug || g_LiteDebug) && (downleveled > 0 || promoted > 0 || moved > 0))
+    {
+        LOG_INFO("server.loading", "[RndBotSync] Target {} band [{}-{}], eligible {}, downleveled {}, promoted {}, moved into zone {}: {}.",
+                 target, bandLower, ceiling, eligible.size(), downleveled, promoted, areaZone, moved);
     }
 }
 
@@ -761,8 +993,10 @@ public:
         }
         RefreshCaches();
         EvaluateDeathKnightGate();
-        LOG_INFO("server.loading", "[RndBotSync] Loaded. CheckFrequency {}s, TargetPercent {}%, TargetBand +/-{}.",
-                 g_CheckFrequency, g_TargetPercent, g_TargetBand);
+        LOG_INFO("server.loading",
+                 "[RndBotSync] Loaded. CheckFrequency {}s, TargetPercent {}%, TargetBand +/-, AreaSync {} (zone {}).",
+                 g_CheckFrequency, g_TargetPercent, g_TargetBand, g_AreaSyncEnabled,
+                 g_AreaSyncUsePlayerZone ? std::string("player's") : std::to_string(g_AreaSyncZone));
     }
 
     void OnUpdate(uint32 diff) override
@@ -891,7 +1125,8 @@ public:
             int bandLower = std::max(static_cast<int>(g_RandomBotMinLevel), target - static_cast<int>(g_TargetBand));
             int ceiling = std::min(static_cast<int>(maxLevel), target + static_cast<int>(g_TargetBand));
 
-            uint32 eligible = 0, inBand = 0, aboveCeiling = 0, belowBand = 0;
+            uint32 eligible = 0, inBand = 0, aboveCeiling = 0, belowBand = 0, inArea = 0;
+            uint32 const botZone = ResolveAreaSyncZone(targetPlayer);
             for (auto const& itr : players)
             {
                 Player* bot = itr.second;
@@ -905,6 +1140,11 @@ public:
                 }
                 ++eligible;
                 int level = static_cast<int>(bot->GetLevel());
+                if (g_AreaSyncEnabled && botZone && bot->GetMapId() == targetPlayer->GetMapId() &&
+                    bot->GetZoneId() == botZone)
+                {
+                    ++inArea;
+                }
                 if (level > ceiling)
                 {
                     ++aboveCeiling;
@@ -925,6 +1165,10 @@ public:
                                      bandLower, ceiling, ceiling, g_TargetPercent, desiredNear);
             handler->PSendSysMessage("  Eligible: {} (in-band {}, above-ceiling {}, below-band {}), AllowDownleveling: {}.",
                                      eligible, inBand, aboveCeiling, belowBand, g_AllowDownleveling);
+            handler->PSendSysMessage("  AreaSync: {}, zone {} -> in-zone {} of desired {}.",
+                                     g_AreaSyncEnabled,
+                                     g_AreaSyncUsePlayerZone ? std::to_string(botZone) : std::to_string(g_AreaSyncZone),
+                                     inArea, desiredNear);
         }
 
         handler->PSendSysMessage("  IlvlSync: {}, gear cap: {}, target best item level: {}.",

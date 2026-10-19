@@ -33,6 +33,10 @@ an empty world.
 - **Item-level cap** — caps bot gear at the player's item level so bots never
   out-gear you, measured from the player's best owned gear (robust to transient
   situational equips like a fishing pole).
+- **Area sync** — progressively moves random bots that are standing outside the
+  highest online real player's **zone** onto one of mod-playerbots' own teleport
+  locations for that zone, until about `TargetPercent`% of the bots are in it.
+  Skips instances and maps not listed in `Playerbots.RandomBotMaps`.
 - **Death Knight progression gating** — optionally keeps Death Knight bots out of
   the world until a real-player account has progressed far enough
   (requires [mod-individual-progression](https://github.com/ZhengPeiRu21/mod-individual-progression)).
@@ -109,6 +113,8 @@ All commands are administrator-only and work from the console and in-game.
 | `RndBotSync.ExcludeNames` | String | "" | Comma-separated, case-insensitive bot names to skip. |
 | `RndBotSync.GuildCacheRefreshFrequency` | Integer | 600 | Seconds between real-player-guild / friend cache refreshes. |
 | `RndBotSync.IlvlSync.Enabled` | Boolean | 1 | Cap bot gear at the player's item level. |
+| `RndBotSync.AreaSync.Enabled` | Boolean | 1 | Progressively gather bots into the player's zone. |
+| `RndBotSync.AreaSync.ZoneId` | Integer | 0 | Pin the target zone id (e.g. 1519 = Stormwind City); 0 = the player's own zone. |
 | `RndBotSync.DeathKnightProgression.Enabled` | Boolean | 0 | Gate Death Knight bots on mod-individual-progression. |
 | `RndBotSync.DeathKnightProgression.RequiredState` | Integer | 13 | Required `ProgressionState` (1–18) to unlock DK bots (13 = WotLK content). |
 | `RndBotSync.FullDebugMode` | Boolean | 0 | Verbose logging. |
@@ -126,6 +132,10 @@ Around it sits a **band** of `±TargetBand` levels; the top of that band is the
    down (when `AllowDownleveling` is on).
 3. **Caps gear** — drives mod-playerbots' own gear-score limit so all bot gear,
    including freshly initialized bots, stays at or below the player's item level.
+4. **Gathers the stragglers** — moves bots standing in a different zone than the
+   player onto one of mod-playerbots' own teleport locations for the player's zone,
+   nearest first, until about `TargetPercent`% of the bots are in that zone. Bots
+   already there are never touched, so the world converges over successive passes.
 
 Passes run on real-player login and level-up, plus the safety timer. The
 `ProcessLimit` spreads large corrections over several passes so nothing happens

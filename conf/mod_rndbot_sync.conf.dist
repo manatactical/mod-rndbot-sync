@@ -31,7 +31,8 @@ RndBotSync.TargetBand = 3
 
 #    RndBotSync.ProcessLimit
 #        Max bots adjusted per pass, shared across downleveling and promotion
-#        (0 = unlimited). Default: 5
+#        (0 = unlimited). When AreaSync is on, half of this budget is reserved for
+#        area moves so level promotion cannot starve them. Default: 5
 RndBotSync.ProcessLimit = 5
 
 #    RndBotSync.AllowDownleveling
@@ -88,6 +89,26 @@ RndBotSync.DeathKnightProgression.RequiredState = 13
 #        When 0, the module restores your configured RandomGearScoreLimit.
 #        Default: 1
 RndBotSync.IlvlSync.Enabled = 1
+
+#    RndBotSync.AreaSync.Enabled
+#        When 1, progressively gather random bots into the highest online real
+#        player's zone: each pass moves a few bots that are standing in a different
+#        zone onto one of mod-playerbots' own teleport locations for that zone,
+#        until about TargetPercent% of the bots are in it (its own slice of the
+#        ProcessLimit budget, so level promotion cannot starve it).
+#        Bots already in the zone are never moved. Instances (dungeons, raids,
+#        battlegrounds) are never targeted, and only maps listed in
+#        Playerbots.RandomBotMaps are used.
+#        Default: 1
+RndBotSync.AreaSync.Enabled = 1
+
+#    RndBotSync.AreaSync.ZoneId
+#        Pin the target zone to this AreaTable.dbc zone id (e.g. 1519 = Stormwind
+#        City, 12 = Elwynn Forest) instead of following the player. Use this if the
+#        bots should always gather somewhere fixed. 0 = use the target player's own
+#        zone, which is what "the same zone as the player" means.
+#        Default: 0
+RndBotSync.AreaSync.ZoneId = 0
 
 #    RndBotSync.FullDebugMode / LiteDebugMode
 #        Verbose / summary logging. Default: 0
