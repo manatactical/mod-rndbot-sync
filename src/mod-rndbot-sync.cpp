@@ -83,7 +83,7 @@ static uint32 g_DkRequiredState = 13;              // PROGRESSION_TBC_TIER_5
 static bool   g_FullDebug = false;
 static bool   g_LiteDebug = false;
 static bool  g_IlvlSyncEnabled = true;      // cap bot gear at the player's ilvl
-static int32 g_OriginalGearScoreLimit = 0;  // configured AiPlayerbot.RandomGearScoreLimit
+static int32 g_OriginalGearScoreLimit = 0;  // configured RandomGearScoreLimit
 static bool   g_ConfiguredPlayerZoneTeleport = false; // configured Playerbots.RandomBotConcentrateInPlayerZone
 static bool   g_AreaSyncEnabled = true;     // gather bots into the player's zone
 static uint32 g_AreaSyncZone = 0;           // fixed zone id; 0 = follow the player's zone
@@ -208,11 +208,14 @@ static void LoadConfig()
     g_AreaSyncZone = areaSyncZone;
     g_AreaSyncUsePlayerZone = (areaSyncZone == 0);
     g_FactionSyncEnabled = sConfigMgr->GetOption<bool>("RndBotSync.FactionSync.Enabled", true);
-    g_ConfiguredAllianceRatio = sConfigMgr->GetOption<uint32>("Playerbots.RandomBotAllianceRatio", 50);
-    g_ConfiguredHordeRatio = sConfigMgr->GetOption<uint32>("Playerbots.RandomBotHordeRatio", 50);
+    g_ConfiguredAllianceRatio = sConfigMgr->GetOption<uint32>("Playerbots.RandomBotAllianceRatio",
+        sConfigMgr->GetOption<uint32>("AiPlayerbot.RandomBotAllianceRatio", 50));
+    g_ConfiguredHordeRatio = sConfigMgr->GetOption<uint32>("Playerbots.RandomBotHordeRatio",
+        sConfigMgr->GetOption<uint32>("AiPlayerbot.RandomBotHordeRatio", 50));
     // Read directly from config so it is order-independent of mod-playerbots and
     // reflects the user's configured value (the cap we restore to when off).
-    g_OriginalGearScoreLimit = sConfigMgr->GetOption<int32>("AiPlayerbot.RandomGearScoreLimit", 0);
+    g_OriginalGearScoreLimit = sConfigMgr->GetOption<int32>("Playerbots.RandomGearScoreLimit",
+        sConfigMgr->GetOption<int32>("AiPlayerbot.RandomGearScoreLimit", 0));
     // playerbots' own "teleport random bots into a real player's zone" filter; see
     // UpdatePlayerZoneTeleport(). Read from config so switching AreaSync off restores the
     // user's value rather than a stale override. Key is the old spelling; playerbots'
@@ -222,14 +225,20 @@ static void LoadConfig()
     g_FullDebug = sConfigMgr->GetOption<bool>("RndBotSync.FullDebugMode", false);
     g_LiteDebug = sConfigMgr->GetOption<bool>("RndBotSync.LiteDebugMode", false);
 
-    g_RandomBotMinLevel = static_cast<uint8>(sConfigMgr->GetOption<uint32>("AiPlayerbot.RandomBotMinLevel", 1));
-    g_RandomBotMaxLevel = static_cast<uint8>(sConfigMgr->GetOption<uint32>("AiPlayerbot.RandomBotMaxLevel", 80));
-    g_RandomBotAccountPrefix = sConfigMgr->GetOption<std::string>("AiPlayerbot.RandomBotAccountPrefix", "rndbot");
+    g_RandomBotMinLevel = static_cast<uint8>(sConfigMgr->GetOption<uint32>("Playerbots.RandomBotMinLevel",
+        sConfigMgr->GetOption<uint32>("AiPlayerbot.RandomBotMinLevel", 1)));
+    g_RandomBotMaxLevel = static_cast<uint8>(sConfigMgr->GetOption<uint32>("Playerbots.RandomBotMaxLevel",
+        sConfigMgr->GetOption<uint32>("AiPlayerbot.RandomBotMaxLevel", 80)));
+    g_RandomBotAccountPrefix = sConfigMgr->GetOption<std::string>("Playerbots.RandomBotAccountPrefix",
+        sConfigMgr->GetOption<std::string>("AiPlayerbot.RandomBotAccountPrefix", "rndbot"));
 
     // mod-playerbots ships its own random-bot re-leveling (level brackets, level reset). Running
     // either alongside this module means two systems fighting over every bot's level, so stand
-    // down. Read straight from config so this is order-independent of mod-playerbots' own init.
-    for (char const* option : { "AiPlayerbot.LevelBrackets.Enabled", "AiPlayerbot.ResetBotLevel.Enabled" })
+    // down. Order-independent of mod-playerbots' own init. A missing option falls back to the
+    // default without a warning, so both the current spelling (Playerbots.*) and the old one
+    // (AiPlayerbot.*) are listed.
+    for (char const* option : { "Playerbots.LevelBrackets.Enabled", "Playerbots.ResetBotLevel.Enabled",
+                                "AiPlayerbot.LevelBrackets.Enabled", "AiPlayerbot.ResetBotLevel.Enabled" })
     {
         if (g_Enabled && sConfigMgr->GetOption<bool>(option, false))
         {
@@ -340,7 +349,7 @@ static bool GetRealPlayerAccountIds(std::vector<uint32>& accountIdsOut)
     accountIdsOut.clear();
     if (g_RandomBotAccountPrefix.empty())
     {
-        LOG_WARN("server.loading", "[RndBotSync] AiPlayerbot.RandomBotAccountPrefix is empty; cannot identify real accounts.");
+        LOG_WARN("server.loading", "[RndBotSync] RandomBotAccountPrefix is empty; cannot identify real accounts.");
         return false;
     }
 
