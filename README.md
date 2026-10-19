@@ -35,12 +35,17 @@ an empty world.
   situational equips like a fishing pole).
 - **Area sync** — progressively moves random bots that are standing outside the
   highest online real player's **zone** onto one of mod-playerbots' own teleport
-  locations for that zone, until about `TargetPercent`% of the bots are in it.
+  locations for that zone — and relevels them into the band on the way — so about
+  `TargetPercent`% of the bots end up **both in that zone and inside the band**.
   Skips instances and maps not listed in `Playerbots.RandomBotMaps`. While area sync is
   on the module also forces playerbots' own `Playerbots.RandomBotConcentrateInPlayerZone`
   to 1, so playerbots' periodic random teleports land in a zone a real player is standing
   in instead of scattering the gathered population back across the world; turning area
   sync off restores the value from `playerbots.conf`.
+- **Faction mirroring** — when the online real players are all on one faction, every
+  random bot is put on that faction (playerbots' alliance/horde ratios are driven to
+  100/0), so a Horde-only realm stops filling half its world with Alliance bots. Both
+  factions online, or nobody online, restores the configured ratios.
 - **Death Knight progression gating** — optionally keeps Death Knight bots out of
   the world until a real-player account has progressed far enough
   (requires [mod-individual-progression](https://github.com/ZhengPeiRu21/mod-individual-progression)).
@@ -106,7 +111,7 @@ All commands are administrator-only and work from the console and in-game.
 |--------|------|---------|-------------|
 | `RndBotSync.Enabled` | Boolean | 1 | Enable/disable the module. |
 | `RndBotSync.CheckFrequency` | Integer | 300 | Seconds between safety-timer passes (`0` = react to events only). |
-| `RndBotSync.TargetPercent` | Integer | 30 | Percent of eligible bots to keep within the band. |
+| `RndBotSync.TargetPercent` | Integer | 30 | Percent of eligible bots to keep within the band; with area sync on, the same number is the in-zone-in-band quota. |
 | `RndBotSync.TargetBand` | Integer | 3 | Band half-width (± levels) and ceiling offset. |
 | `RndBotSync.ProcessLimit` | Integer | 5 | Max bots adjusted per pass (`0` = unlimited). |
 | `RndBotSync.AllowDownleveling` | Boolean | 1 | Pull bots above the ceiling down. `0` = upward-only. |
@@ -119,6 +124,7 @@ All commands are administrator-only and work from the console and in-game.
 | `RndBotSync.IlvlSync.Enabled` | Boolean | 1 | Cap bot gear at the player's item level. |
 | `RndBotSync.AreaSync.Enabled` | Boolean | 1 | Progressively gather bots into the player's zone. |
 | `RndBotSync.AreaSync.ZoneId` | Integer | 0 | Pin the target zone id (e.g. 1519 = Stormwind City); 0 = the player's own zone. |
+| `RndBotSync.FactionSync.Enabled` | Boolean | 1 | Force every bot onto the faction the online real players are on. |
 | `Playerbots.RandomBotConcentrateInPlayerZone` | Boolean | 0 | Read from `playerbots.conf`, not from this file (newer playerbots builds spell it `Playerbots.randomBotConcentrateInPlayerZone`). Forced to 1 while area sync is enabled; restored when it is off. |
 | `RndBotSync.DeathKnightProgression.Enabled` | Boolean | 0 | Gate Death Knight bots on mod-individual-progression. |
 | `RndBotSync.DeathKnightProgression.RequiredState` | Integer | 13 | Required `ProgressionState` (1–18) to unlock DK bots (13 = WotLK content). |
@@ -139,8 +145,13 @@ Around it sits a **band** of `±TargetBand` levels; the top of that band is the
    including freshly initialized bots, stays at or below the player's item level.
 4. **Gathers the stragglers** — moves bots standing in a different zone than the
    player onto one of mod-playerbots' own teleport locations for the player's zone,
-   nearest first, until about `TargetPercent`% of the bots are in that zone. Bots
-   already there are never touched, so the world converges over successive passes.
+   nearest first, releveling each one into the band as it goes, until about
+   `TargetPercent`% of the bots are both in that zone and in the band. A bot already
+   in the zone but out of the band is only releveled. In-band bots in the zone are
+   never touched, so the world converges over successive passes.
+5. **Mirrors the faction** — snaps playerbots' alliance/horde ratios to the teams the
+   online real players are actually on, so a one-faction realm does not spawn bots on
+   the other one.
 
 Passes run on real-player login and level-up, plus the safety timer. The
 `safety timer` alternates between the level steps and the zone step, so a pass never

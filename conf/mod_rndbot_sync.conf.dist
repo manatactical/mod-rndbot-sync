@@ -22,7 +22,10 @@ RndBotSync.Enabled = 1
 RndBotSync.CheckFrequency = 300
 
 #    RndBotSync.TargetPercent
-#        Percent of eligible random bots to keep within the band. Default: 30
+#        Percent of eligible random bots to keep within the band. With AreaSync on the
+#        same number is the quota that must be BOTH in the target player's zone and
+#        inside the band, so 80 plus AreaSync means "80% of the bots near me, in my
+#        zone". Default: 30
 RndBotSync.TargetPercent = 30
 
 #    RndBotSync.TargetBand
@@ -32,7 +35,9 @@ RndBotSync.TargetBand = 3
 #    RndBotSync.ProcessLimit
 #        Max bots adjusted per pass, shared across downleveling and promotion
 #        (0 = unlimited). When AreaSync is on, half of this budget is reserved for
-#        area moves so level promotion cannot starve them. Default: 5
+#        area moves so level promotion cannot starve them. A bot moved into the
+#        zone may also spend its slot on the level change that makes it in-band.
+#        Default: 5
 RndBotSync.ProcessLimit = 5
 
 #    RndBotSync.AllowDownleveling
@@ -93,9 +98,11 @@ RndBotSync.IlvlSync.Enabled = 1
 #    RndBotSync.AreaSync.Enabled
 #        When 1, progressively gather random bots into the highest online real
 #        player's zone: each pass moves a few bots that are standing in a different
-#        zone onto one of mod-playerbots' own teleport locations for that zone,
-#        until about TargetPercent% of the bots are in it (its own slice of the
-#        ProcessLimit budget, so level promotion cannot starve it).
+#        zone onto one of mod-playerbots' own teleport locations for that zone, so
+#        that about TargetPercent% of the bots are BOTH in that zone AND inside the
+#        level band (a bot gathered from far away is first releveled into the band,
+#        so what arrives is playable with the target player). A bot already in the
+#        zone but out of the band is only releveled, never teleported.
 #        Bots already in the zone are never moved. Instances (dungeons, raids,
 #        battlegrounds) are never targeted, and only maps listed in
 #        Playerbots.RandomBotMaps are used.
@@ -115,6 +122,19 @@ RndBotSync.AreaSync.Enabled = 1
 #        zone, which is what "the same zone as the player" means.
 #        Default: 0
 RndBotSync.AreaSync.ZoneId = 0
+
+#    RndBotSync.FactionSync.Enabled
+#        When 1 and the online real players are all on one faction, every random bot
+#        is put on that faction: the module sets playerbots' RandomBotAllianceRatio/
+#        RandomBotHordeRatio to 100/0 or 0/100, which is what decides the team of
+#        both a bot login and a newly created bot character. So a Horde-only realm
+#        stops spawning half its bots as Alliance. With players online on both
+#        factions (or nobody online) the ratios configured in playerbots.conf are
+#        restored. The ratio is re-evaluated on every pass and on reload, but the
+#        bots already logged in on the other faction keep playing until they next
+#        log out - they are not kicked.
+#        Default: 1
+RndBotSync.FactionSync.Enabled = 1
 
 #    Playerbots.RandomBotConcentrateInPlayerZone / Playerbots.randomBotConcentrateInPlayerZone
 #        mod-playerbots' own switch (read from playerbots.conf, not from this file;

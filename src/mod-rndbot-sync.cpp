@@ -88,6 +88,10 @@ static bool   g_ConfiguredPlayerZoneTeleport = false; // configured Playerbots.R
 static bool   g_AreaSyncEnabled = true;     // gather bots into the player's zone
 static uint32 g_AreaSyncZone = 0;           // fixed zone id; 0 = follow the player's zone
 static bool   g_AreaSyncUsePlayerZone = true; // true = use the player's current zone id
+static bool   g_FactionSyncEnabled = true;  // force every bot onto the real players' faction
+// playerbots' configured ratios, kept so switching FactionSync off restores them.
+static uint32 g_ConfiguredAllianceRatio = 50;
+static uint32 g_ConfiguredHordeRatio = 50;
 
 // mod-playerbots' own baseline, captured on the first EvaluateDeathKnightGate() call so the
 // module can restore it when DeathKnightProgression is switched off (instead of leaving its
@@ -203,6 +207,9 @@ static void LoadConfig()
     uint32 const areaSyncZone = sConfigMgr->GetOption<uint32>("RndBotSync.AreaSync.ZoneId", 0);
     g_AreaSyncZone = areaSyncZone;
     g_AreaSyncUsePlayerZone = (areaSyncZone == 0);
+    g_FactionSyncEnabled = sConfigMgr->GetOption<bool>("RndBotSync.FactionSync.Enabled", true);
+    g_ConfiguredAllianceRatio = sConfigMgr->GetOption<uint32>("Playerbots.RandomBotAllianceRatio", 50);
+    g_ConfiguredHordeRatio = sConfigMgr->GetOption<uint32>("Playerbots.RandomBotHordeRatio", 50);
     // Read directly from config so it is order-independent of mod-playerbots and
     // reflects the user's configured value (the cap we restore to when off).
     g_OriginalGearScoreLimit = sConfigMgr->GetOption<int32>("AiPlayerbot.RandomGearScoreLimit", 0);
@@ -654,6 +661,59 @@ static void UpdatePlayerZoneTeleport()
     }
 }
 
+// The set of teams the online real players are on. Empty when nobody real is online.
+static std::pair<bool, bool> CollectRealPlayerTeams()
+{
+    bool alliance = false;
+    bool horde = false;
+    for (auto const& itr : ObjectAccessor::GetPlayers())
+    {
+        Player* player = itr.second;
+        if (!player || !player->IsInWorld() || !IsHumanPlayer(player))
+        {
+            continue;
+        }
+        if (player->GetTeamId() == TEAM_ALLIANCE)
+        {
+            alliance = true;
+        }
+        else if (player->GetTeamId() == TEAM_HORDE)
+        {
+            horde = true;
+        }
+    }
+    return { alliance, horde };
+}
+
+// Drives playerbots' random-bot faction ratios so every bot is on a team a real player is
+// playing. On a one-faction realm this is what stops half the bot population from logging in
+// as the empty faction, and it also pins the race a newly created bot character rolls
+// (RandomPlayerbotFactory::CreateRandomBot picks the team by coin flip). Both teams online,
+// or FactionSync switched off, restores the configured ratio.
+static void UpdateFactionRatio()
+{
+    auto const [allianceOnline, hordeOnline] = CollectRealPlayerTeams();
+    bool const mirror = g_FactionSyncEnabled && (allianceOnline != hordeOnline);
+
+    uint32 const allianceWanted = mirror ? (allianceOnline ? 1u : 0u) : g_ConfiguredAllianceRatio;
+    uint32 const hordeWanted = mirror ? (hordeOnline ? 1u : 0u) : g_ConfiguredHordeRatio;
+
+    if (sPlayerbotAIConfig.randomBotAllianceRatio == allianceWanted &&
+        sPlayerbotAIConfig.randomBotHordeRatio == hordeWanted)
+    {
+        return;
+    }
+
+    sPlayerbotAIConfig.randomBotAllianceRatio = allianceWanted;
+    sPlayerbotAIConfig.randomBotHordeRatio = hordeWanted;
+
+    if (g_FullDebug || g_LiteDebug)
+    {
+        LOG_INFO("server.loading", "[RndBotSync] Bot faction ratio set to {}A/{}H (alliance online {}, horde online {}).",
+                 allianceWanted, hordeWanted, +allianceOnline, +hordeOnline);
+    }
+}
+
 // ---- Adjustment pass ---------------------------------------------------------
 
 // True if the bot's transient state allows a level change right now. Persistent
@@ -980,16 +1040,30 @@ static uint32 PromoteIntoBand(std::vector<Player*> const& eligible, int bandLowe
     return changed;
 }
 
-// Moves the nearest bots standing outside the target zone onto a teleport location inside it.
+// Moves the nearest bots standing outside the target zone, or inside it above the level band, onto a
+// teleport location in the zone at a level inside the band. "Near" is the combined quota: in the zone
+// AND playable with the target player, so a gathered bot is one the player can actually group with. A
+// moved bot is levelled into the band first, because the teleport can refuse and a refused level change
+// is harmless while a refused teleport after a level change would leave the deficit unpaid.
 // Returns the number moved.
 static uint32 GatherIntoZone(std::vector<Player*> const& eligible, Player* targetPlayer, uint32 zoneId,
-                             uint32 desiredNear, bool unlimited, uint32& areaBudget)
+                             int bandLower, int ceiling, uint32 desiredNear, bool unlimited, uint32& areaBudget)
 {
+    auto inZone = [&](Player* bot)
+    {
+        return bot->GetMapId() == targetPlayer->GetMapId() && bot->GetZoneId() == zoneId;
+    };
+    auto inBand = [&](Player* bot)
+    {
+        int const level = static_cast<int>(bot->GetLevel());
+        return level >= bandLower && level <= ceiling;
+    };
+
     uint32 currentNear = 0;
     std::vector<Player*> outsideZone;
     for (Player* bot : eligible)
     {
-        if (bot->GetMapId() == targetPlayer->GetMapId() && bot->GetZoneId() == zoneId)
+        if (inZone(bot) && inBand(bot))
         {
             ++currentNear;
         }
@@ -1030,6 +1104,23 @@ static uint32 GatherIntoZone(std::vector<Player*> const& eligible, Player* targe
         {
             break;
         }
+        // Already in the zone but out of band: skip the teleport, just fix the level here.
+        if (inZone(bot) && SetBotLevelInRange(bot, bandLower, ceiling))
+        {
+            ++changed;
+            --need;
+            if (!unlimited)
+            {
+                --areaBudget;
+            }
+            continue;
+        }
+        // A bot relocates itself in the same zone when it is out of the band, so the teleport below
+        // stays a genuine move. Unsafe or unchangeable bots keep their level untouched.
+        if (!inBand(bot) && !SetBotLevelInRange(bot, bandLower, ceiling))
+        {
+            continue;
+        }
         // Unsafe, unreachable or zone-less bots are skipped without spending budget or the deficit.
         if (MoveBotToPlayerZone(bot, targetPlayer, zoneId))
         {
@@ -1069,6 +1160,7 @@ static void RunAdjustmentPass(bool unlimitedBudget = false, PassPart part = Pass
     // pass.
     UpdateGlobalGearCap(targetPlayer);
     UpdatePlayerZoneTeleport();
+    UpdateFactionRatio();
 
     if (target < 0)
     {
@@ -1140,7 +1232,7 @@ static void RunAdjustmentPass(bool unlimitedBudget = false, PassPart part = Pass
     }
     if (areaWanted && (unlimited || areaBudget > 0))
     {
-        moved = GatherIntoZone(eligible, targetPlayer, areaZone, desiredNear, unlimited, areaBudget);
+        moved = GatherIntoZone(eligible, targetPlayer, areaZone, bandLower, ceiling, desiredNear, unlimited, areaBudget);
     }
 
     if ((g_FullDebug || g_LiteDebug) && (downleveled > 0 || promoted > 0 || moved > 0))
@@ -1176,9 +1268,9 @@ public:
         EvaluateDeathKnightGate();
         g_DkApplied = g_DkProgressionEnabled;
         LOG_INFO("server.loading",
-                 "[RndBotSync] Loaded. CheckFrequency {}s, TargetPercent {}%, TargetBand +/-, AreaSync {} (zone {}).",
+                 "[RndBotSync] Loaded. CheckFrequency {}s, TargetPercent {}%, TargetBand +/-, AreaSync {} (zone {}), FactionSync {}.",
                  g_CheckFrequency, g_TargetPercent, g_TargetBand, g_AreaSyncEnabled,
-                 g_AreaSyncUsePlayerZone ? std::string("player's") : std::to_string(g_AreaSyncZone));
+                 g_AreaSyncUsePlayerZone ? std::string("player's") : std::to_string(g_AreaSyncZone), g_FactionSyncEnabled);
     }
 
     void OnUpdate(uint32 diff) override
@@ -1283,6 +1375,7 @@ public:
         g_DkApplied = g_DkProgressionEnabled;
         UpdateGlobalGearCap(nullptr);
         UpdatePlayerZoneTeleport();
+        UpdateFactionRatio();
         handler->SendSysMessage("[RndBotSync] Config reloaded.");
         return true;
     }
@@ -1315,7 +1408,7 @@ public:
             {
                 int const level = static_cast<int>(bot->GetLevel());
                 if (g_AreaSyncEnabled && botZone && bot->GetMapId() == targetPlayer->GetMapId() &&
-                    bot->GetZoneId() == botZone)
+                    bot->GetZoneId() == botZone && level >= bandLower && level <= ceiling)
                 {
                     ++inArea;
                 }
@@ -1341,7 +1434,7 @@ public:
                                      bandLower, ceiling, ceiling, g_TargetPercent, desiredNear);
             handler->PSendSysMessage("  Eligible: {} (in-band {}, above-ceiling {}, below-band {}), AllowDownleveling: {}.",
                                      eligible, inBand, aboveCeiling, belowBand, g_AllowDownleveling);
-            handler->PSendSysMessage("  AreaSync: {}, zone {} -> in-zone {} of desired {}.",
+            handler->PSendSysMessage("  AreaSync: {}, zone {} -> in-zone-and-in-band {} of desired {}.",
                                      g_AreaSyncEnabled,
                                      g_AreaSyncUsePlayerZone ? std::to_string(botZone) : std::to_string(g_AreaSyncZone),
                                      inArea, desiredNear);
@@ -1352,6 +1445,10 @@ public:
                                  targetPlayer ? GetBestOwnedItemLevel(targetPlayer) : 0);
         handler->PSendSysMessage("  DK gate: {}, {} (RequiredState {}).",
                                  g_DkProgressionEnabled, g_DkUnlocked ? "unlocked" : "locked", g_DkRequiredState);
+        auto const [allianceOnline, hordeOnline] = CollectRealPlayerTeams();
+        handler->PSendSysMessage("  FactionSync: {} (players online {}A/{}H), bot ratios {}A/{}H.",
+                                 g_FactionSyncEnabled, +allianceOnline, +hordeOnline,
+                                 sPlayerbotAIConfig.randomBotAllianceRatio, sPlayerbotAIConfig.randomBotHordeRatio);
         return true;
     }
 
