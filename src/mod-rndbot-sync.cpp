@@ -71,6 +71,8 @@ static bool IsHumanPlayer(Player* player);
 static bool IsPlayerRandomBot(Player* player);
 static bool IsBotExcluded(Player* bot);
 static bool BotSuitsItsZone(Player* bot);
+static void ResolveGatherBand(Player* bot, uint32 zoneId, int playerBandLower, int playerCeiling,
+                              int& bandLowerOut, int& ceilingOut, bool& spreadOut);
 
 // ---- Configuration -----------------------------------------------------------
 static bool   g_Enabled = true;
