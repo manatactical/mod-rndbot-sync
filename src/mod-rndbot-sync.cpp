@@ -677,7 +677,7 @@ static bool IsBotSafeToTeleport(Player* bot)
 // True if the map is one mod-playerbots itself allows bots to be teleported to.
 static bool BotMapAllowed(uint32 mapId)
 {
-    auto const& maps = sPlayerbotAIConfig.RandomBotMaps;
+    auto const& maps = sPlayerbotAIConfig.randomBotMaps;
     return std::find(maps.begin(), maps.end(), mapId) != maps.end();
 }
 
