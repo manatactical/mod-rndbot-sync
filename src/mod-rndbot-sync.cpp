@@ -29,6 +29,7 @@
 #include "WorldSession.h"
 #include "ObjectAccessor.h"
 #include "Map.h"
+#include "MapMgr.h"
 #include "GameTime.h"
 #include "DatabaseEnv.h"
 #include "QueryResult.h"
@@ -58,6 +59,8 @@
 #include <sstream>
 #include <algorithm>
 #include <unordered_set>
+#include <unordered_map>
+#include <utility>
 #include <cctype>
 #include <cmath>
 
@@ -238,53 +241,7 @@ static void LoadConfig()
     g_RandomBotAccountPrefix = sConfigMgr->GetOption<std::string>("Playerbots.RandomBotAccountPrefix",
         sConfigMgr->GetOption<std::string>("AiPlayerbot.RandomBotAccountPrefix", "rndbot"));
 
-    static std::unordered_map<uint32, std::pair<int32, int32>> CreatureLevelsInZone;
-
-// Builds the zone -> [minLevel, maxLevel] map from the creature spawns, so a bot sent to a low-level
-// zone can be releveled to match it. The spawns are read from the object manager's loaded spawns, not
-// the DB, so this is a one-off pass over memory, run off the startup path that mod-playerbots needs.
-// Zones with no spawns simply stay absent, and a bot headed there keeps the whole level range instead.
-static void BuildCreatureLevelsInZone()
-{
-    CreatureLevelsInZone.clear();
-
-    for (auto const& itr : sObjectMgr->GetAllCreatureData())
-    {
-        CreatureData const& spawn = itr.second;
-        CreatureTemplate const* proto = sObjectMgr->GetCreatureTemplate(spawn.id);
-        if (!proto)
-        {
-            continue;
-        }
-        // Skip non-combat spawns: a city full of level 1 critters and guards is not the zone's level.
-        if ((proto->npcflag & (UNIT_NPC_FLAG_VENDOR | UNIT_NPC_FLAG_FLIGHTMASTER | UNIT_NPC_FLAG_INNKEEPER)) ||
-            proto->faction == 35)
-        {
-            continue;
-        }
-        if (proto->minlevel == 0 || proto->minlevel > proto->maxlevel)
-        {
-            continue;
-        }
-
-        uint32 const zoneId = sMapMgr->GetZoneId(PHASEMASK_NORMAL, spawn.mapid, spawn.posX, spawn.posY, spawn.posZ);
-        if (!zoneId)
-        {
-            continue;
-        }
-
-        auto& bounds = CreatureLevelsInZone[zoneId];
-        if (bounds.second == 0)
-        {
-            bounds = { proto->minlevel, proto->maxlevel };
-            continue;
-        }
-        bounds.first = std::min(bounds.first, static_cast<int32>(proto->minlevel));
-        bounds.second = std::max(bounds.second, static_cast<int32>(proto->maxlevel));
-    }
-}
-
-// mod-playerbots ships its own random-bot re-leveling (level brackets, level reset). Running
+    // mod-playerbots ships its own random-bot re-leveling (level brackets, level reset). Running
     // either alongside this module means two systems fighting over every bot's level, so stand
     // down. Order-independent of mod-playerbots' own init. A missing option falls back to the
     // default without a warning, so both the current spelling (Playerbots.*) and the old one
@@ -320,6 +277,53 @@ static void BuildCreatureLevelsInZone()
 
 // ---- Identity ----------------------------------------------------------------
 static std::unordered_set<uint32> g_SocialFriendsList;
+
+// Zone -> [minLevel, maxLevel] over the loaded creature spawns, built once at startup. Backs the
+// "match the zone's level" half of area sync.
+static std::unordered_map<uint32, std::pair<int32, int32>> CreatureLevelsInZone;
+
+// Fills CreatureLevelsInZone from the object manager's already-loaded creature spawns, so a bot sent to
+// a low-level zone can be releveled to match it. Read from memory, not the DB, so it is a one-off pass
+// with no query storm. Zones with no spawns stay absent and keep the whole level range.
+static void BuildCreatureLevelsInZone()
+{
+    CreatureLevelsInZone.clear();
+
+    for (auto const& itr : sObjectMgr->GetAllCreatureData())
+    {
+        CreatureData const& spawn = itr.second;
+        CreatureTemplate const* proto = sObjectMgr->GetCreatureTemplate(spawn.id);
+        if (!proto)
+        {
+            continue;
+        }
+        // Skip non-combat spawns: a city full of level 1 critters and vendors is not the zone's level.
+        if ((proto->npcflag & (UNIT_NPC_FLAG_VENDOR | UNIT_NPC_FLAG_FLIGHTMASTER | UNIT_NPC_FLAG_INNKEEPER)) ||
+            proto->faction == 35)
+        {
+            continue;
+        }
+        if (proto->minlevel == 0 || proto->minlevel > proto->maxlevel)
+        {
+            continue;
+        }
+
+        uint32 const zoneId = sMapMgr->GetZoneId(PHASEMASK_NORMAL, spawn.mapid, spawn.posX, spawn.posY, spawn.posZ);
+        if (!zoneId)
+        {
+            continue;
+        }
+
+        auto& bounds = CreatureLevelsInZone[zoneId];
+        if (bounds.second == 0)
+        {
+            bounds = { proto->minlevel, proto->maxlevel };
+            continue;
+        }
+        bounds.first = std::min(bounds.first, static_cast<int32>(proto->minlevel));
+        bounds.second = std::max(bounds.second, static_cast<int32>(proto->maxlevel));
+    }
+}
 
 static bool IsPlayerRandomBot(Player* player)
 {
