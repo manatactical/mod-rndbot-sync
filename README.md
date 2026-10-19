@@ -36,7 +36,11 @@ an empty world.
 - **Area sync** — progressively moves random bots that are standing outside the
   highest online real player's **zone** onto one of mod-playerbots' own teleport
   locations for that zone, until about `TargetPercent`% of the bots are in it.
-  Skips instances and maps not listed in `Playerbots.RandomBotMaps`.
+  Skips instances and maps not listed in `Playerbots.RandomBotMaps`. While area sync is
+  on the module also forces playerbots' own `Playerbots.RandomBotConcentrateInPlayerZone`
+  to 1, so playerbots' periodic random teleports land in a zone a real player is standing
+  in instead of scattering the gathered population back across the world; turning area
+  sync off restores the value from `playerbots.conf`.
 - **Death Knight progression gating** — optionally keeps Death Knight bots out of
   the world until a real-player account has progressed far enough
   (requires [mod-individual-progression](https://github.com/ZhengPeiRu21/mod-individual-progression)).
@@ -115,6 +119,7 @@ All commands are administrator-only and work from the console and in-game.
 | `RndBotSync.IlvlSync.Enabled` | Boolean | 1 | Cap bot gear at the player's item level. |
 | `RndBotSync.AreaSync.Enabled` | Boolean | 1 | Progressively gather bots into the player's zone. |
 | `RndBotSync.AreaSync.ZoneId` | Integer | 0 | Pin the target zone id (e.g. 1519 = Stormwind City); 0 = the player's own zone. |
+| `Playerbots.RandomBotConcentrateInPlayerZone` | Boolean | 0 | Read from `playerbots.conf`, not from this file. Forced to 1 while area sync is enabled; restored when it is off. |
 | `RndBotSync.DeathKnightProgression.Enabled` | Boolean | 0 | Gate Death Knight bots on mod-individual-progression. |
 | `RndBotSync.DeathKnightProgression.RequiredState` | Integer | 13 | Required `ProgressionState` (1–18) to unlock DK bots (13 = WotLK content). |
 | `RndBotSync.FullDebugMode` | Boolean | 0 | Verbose logging. |

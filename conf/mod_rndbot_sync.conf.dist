@@ -99,6 +99,12 @@ RndBotSync.IlvlSync.Enabled = 1
 #        Bots already in the zone are never moved. Instances (dungeons, raids,
 #        battlegrounds) are never targeted, and only maps listed in
 #        Playerbots.RandomBotMaps are used.
+#        While this is on the module also forces playerbots'
+#        Playerbots.RandomBotConcentrateInPlayerZone to 1. This module only moves a
+#        few bots per pass, and playerbots re-teleports every random bot on its own
+#        1-5h timer, which would scatter the gathered population straight back out;
+#        with that filter on, every one of those teleports lands in a zone a real
+#        player is in. Switching this off restores your configured value.
 #        Default: 1
 RndBotSync.AreaSync.Enabled = 1
 
@@ -109,6 +115,14 @@ RndBotSync.AreaSync.Enabled = 1
 #        zone, which is what "the same zone as the player" means.
 #        Default: 0
 RndBotSync.AreaSync.ZoneId = 0
+
+#    Playerbots.RandomBotConcentrateInPlayerZone
+#        mod-playerbots' own switch (read from playerbots.conf, not from this file):
+#        when 1, its random teleports only pick level-appropriate open-world zones
+#        that hold a real player, instead of the whole world. The module forces it
+#        on while AreaSync is enabled, regardless of what playerbots.conf says, and
+#        restores the configured value when AreaSync is turned off.
+#        Default: 0
 
 #    RndBotSync.FullDebugMode / LiteDebugMode
 #        Verbose / summary logging. Default: 0

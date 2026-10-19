@@ -84,6 +84,7 @@ static bool   g_FullDebug = false;
 static bool   g_LiteDebug = false;
 static bool  g_IlvlSyncEnabled = true;      // cap bot gear at the player's ilvl
 static int32 g_OriginalGearScoreLimit = 0;  // configured AiPlayerbot.RandomGearScoreLimit
+static bool   g_ConfiguredPlayerZoneTeleport = false; // configured Playerbots.RandomBotConcentrateInPlayerZone
 static bool   g_AreaSyncEnabled = true;     // gather bots into the player's zone
 static uint32 g_AreaSyncZone = 0;           // fixed zone id; 0 = follow the player's zone
 static bool   g_AreaSyncUsePlayerZone = true; // true = use the player's current zone id
@@ -205,6 +206,10 @@ static void LoadConfig()
     // Read directly from config so it is order-independent of mod-playerbots and
     // reflects the user's configured value (the cap we restore to when off).
     g_OriginalGearScoreLimit = sConfigMgr->GetOption<int32>("AiPlayerbot.RandomGearScoreLimit", 0);
+    // playerbots' own "teleport random bots into a real player's zone" filter; see
+    // UpdatePlayerZoneTeleport(). Read from config so switching AreaSync off restores the
+    // user's value rather than a stale override.
+    g_ConfiguredPlayerZoneTeleport = sConfigMgr->GetOption<bool>("Playerbots.RandomBotConcentrateInPlayerZone", false);
     g_FullDebug = sConfigMgr->GetOption<bool>("RndBotSync.FullDebugMode", false);
     g_LiteDebug = sConfigMgr->GetOption<bool>("RndBotSync.LiteDebugMode", false);
 
@@ -626,6 +631,27 @@ static void UpdateGlobalGearCap(Player* targetPlayer)
     }
 }
 
+// Turns playerbots' own teleport filter on while area sync is enabled. This module only moves
+// a few bots per pass, and playerbots re-teleports every random bot on its own timer anyway
+// (including the 1800s push after a move below), which previously scattered the gathered
+// population straight back out. With the filter on, each of those teleports lands in a zone a
+// real player is standing in, so the zone fills at teleport rate instead of pass rate.
+static void UpdatePlayerZoneTeleport()
+{
+    bool const wanted = g_ConfiguredPlayerZoneTeleport || g_AreaSyncEnabled;
+    if (sPlayerbotAIConfig.RandomBotConcentrateInPlayerZone == wanted)
+    {
+        return;
+    }
+
+    sPlayerbotAIConfig.RandomBotConcentrateInPlayerZone = wanted;
+
+    if (g_FullDebug || g_LiteDebug)
+    {
+        LOG_INFO("server.loading", "[RndBotSync] Playerbots zone teleport filter set to {}.", wanted);
+    }
+}
+
 // ---- Adjustment pass ---------------------------------------------------------
 
 // True if the bot's transient state allows a level change right now. Persistent
@@ -1040,6 +1066,7 @@ static void RunAdjustmentPass(bool unlimitedBudget = false, PassPart part = Pass
     // none online). Independent of the level-adjustment steps, so it also runs for an area-only
     // pass.
     UpdateGlobalGearCap(targetPlayer);
+    UpdatePlayerZoneTeleport();
 
     if (target < 0)
     {
@@ -1253,6 +1280,7 @@ public:
         EvaluateDeathKnightGate();
         g_DkApplied = g_DkProgressionEnabled;
         UpdateGlobalGearCap(nullptr);
+        UpdatePlayerZoneTeleport();
         handler->SendSysMessage("[RndBotSync] Config reloaded.");
         return true;
     }
