@@ -48,6 +48,10 @@
 #include "Item.h"
 #include "Bag.h"
 #include "ItemTemplate.h"
+#include "ObjectMgr.h"
+#include "CreatureData.h"
+#include "CreatureTemplate.h"
+#include "DBCStores.h"
 
 // Standard library
 #include <string>
@@ -64,6 +68,7 @@ using namespace Acore::ChatCommands;
 static bool IsHumanPlayer(Player* player);
 static bool IsPlayerRandomBot(Player* player);
 static bool IsBotExcluded(Player* bot);
+static bool BotSuitsItsZone(Player* bot);
 
 // ---- Configuration -----------------------------------------------------------
 static bool   g_Enabled = true;
@@ -88,6 +93,7 @@ static bool   g_ConfiguredPlayerZoneTeleport = false; // configured Playerbots.R
 static bool   g_AreaSyncEnabled = true;     // gather bots into the player's zone
 static uint32 g_AreaSyncZone = 0;           // fixed zone id; 0 = follow the player's zone
 static bool   g_AreaSyncUsePlayerZone = true; // true = use the player's current zone id
+static uint32 g_ZoneSpreadPercent = 30;     // % of a zone's bots matched to the zone's own level
 static bool   g_FactionSyncEnabled = true;  // force every bot onto the real players' faction
 // playerbots' configured ratios, kept so switching FactionSync off restores them.
 static uint32 g_ConfiguredAllianceRatio = 50;
@@ -207,6 +213,7 @@ static void LoadConfig()
     uint32 const areaSyncZone = sConfigMgr->GetOption<uint32>("RndBotSync.AreaSync.ZoneId", 0);
     g_AreaSyncZone = areaSyncZone;
     g_AreaSyncUsePlayerZone = (areaSyncZone == 0);
+    g_ZoneSpreadPercent = std::min<uint32>(sConfigMgr->GetOption<uint32>("RndBotSync.ZoneSpreadPercent", 30), 100);
     g_FactionSyncEnabled = sConfigMgr->GetOption<bool>("RndBotSync.FactionSync.Enabled", true);
     g_ConfiguredAllianceRatio = sConfigMgr->GetOption<uint32>("Playerbots.RandomBotAllianceRatio",
         sConfigMgr->GetOption<uint32>("AiPlayerbot.RandomBotAllianceRatio", 50));
@@ -232,7 +239,53 @@ static void LoadConfig()
     g_RandomBotAccountPrefix = sConfigMgr->GetOption<std::string>("Playerbots.RandomBotAccountPrefix",
         sConfigMgr->GetOption<std::string>("AiPlayerbot.RandomBotAccountPrefix", "rndbot"));
 
-    // mod-playerbots ships its own random-bot re-leveling (level brackets, level reset). Running
+    static std::unordered_map<uint32, std::pair<int32, int32>> CreatureLevelsInZone;
+
+// Builds the zone -> [minLevel, maxLevel] map from the creature spawns, so a bot sent to a low-level
+// zone can be releveled to match it. The spawns are read from the object manager's loaded spawns, not
+// the DB, so this is a one-off pass over memory, run off the startup path that mod-playerbots needs.
+// Zones with no spawns simply stay absent, and a bot headed there keeps the whole level range instead.
+static void BuildCreatureLevelsInZone()
+{
+    CreatureLevelsInZone.clear();
+
+    for (auto const& itr : sObjectMgr->GetAllCreatureData())
+    {
+        CreatureData const& spawn = itr.second;
+        CreatureTemplate const* proto = sObjectMgr->GetCreatureTemplate(spawn.id);
+        if (!proto)
+        {
+            continue;
+        }
+        // Skip non-combat spawns: a city full of level 1 critters and guards is not the zone's level.
+        if ((proto->npcflag & (UNIT_NPC_FLAG_VENDOR | UNIT_NPC_FLAG_FLIGHTMASTER | UNIT_NPC_FLAG_INNKEEPER)) ||
+            proto->faction == 35)
+        {
+            continue;
+        }
+        if (proto->minlevel == 0 || proto->minlevel > proto->maxlevel)
+        {
+            continue;
+        }
+
+        uint32 const zoneId = sMapMgr->GetZoneId(PHASEMASK_NORMAL, spawn.mapid, spawn.posX, spawn.posY, spawn.posZ);
+        if (!zoneId)
+        {
+            continue;
+        }
+
+        auto& bounds = CreatureLevelsInZone[zoneId];
+        if (bounds.second == 0)
+        {
+            bounds = { proto->minlevel, proto->maxlevel };
+            continue;
+        }
+        bounds.first = std::min(bounds.first, static_cast<int32>(proto->minlevel));
+        bounds.second = std::max(bounds.second, static_cast<int32>(proto->maxlevel));
+    }
+}
+
+// mod-playerbots ships its own random-bot re-leveling (level brackets, level reset). Running
     // either alongside this module means two systems fighting over every bot's level, so stand
     // down. Order-independent of mod-playerbots' own init. A missing option falls back to the
     // default without a warning, so both the current spelling (Playerbots.*) and the old one
@@ -978,6 +1031,11 @@ static uint32 DownlevelAboveCeiling(std::vector<Player*> const& eligible, int ba
         {
             break;
         }
+        // A bot sitting at the level of the zone it is in is where area sync wants it: leave it alone.
+        if (BotSuitsItsZone(bot))
+        {
+            continue;
+        }
         // Scatter across [RandomBotMinLevel, ceiling] to keep a level spread. A bot the
         // player deliberately guilded is a companion, not filler: keep it in the band instead
         // (only reachable with IgnoreGuildBotsWithRealPlayers = 0). Unsafe bots (combat,
@@ -1035,6 +1093,11 @@ static uint32 PromoteIntoBand(std::vector<Player*> const& eligible, int bandLowe
         {
             break;
         }
+        // Same rule as the downlevel step: a bot at its zone's level is not a straggler to pull up.
+        if (BotSuitsItsZone(bot))
+        {
+            continue;
+        }
         // Unsafe bots are skipped without spending budget or the deficit.
         if (SetBotLevelInRange(bot, bandLower, ceiling))
         {
@@ -1072,7 +1135,10 @@ static uint32 GatherIntoZone(std::vector<Player*> const& eligible, Player* targe
     std::vector<Player*> outsideZone;
     for (Player* bot : eligible)
     {
-        if (inZone(bot) && inBand(bot))
+        // A bot standing in the zone at a level that suits the zone is local colour the player can see:
+        // it counts towards the quota, so the pass does not summon a second bot on top of it. Only bots
+        // that cannot be counted this way need to be brought up to the player's band instead.
+        if (inZone(bot) && (inBand(bot) || BotSuitsItsZone(bot)))
         {
             ++currentNear;
         }
@@ -1113,20 +1179,40 @@ static uint32 GatherIntoZone(std::vector<Player*> const& eligible, Player* targe
         {
             break;
         }
-        // Already in the zone but out of band: skip the teleport, just fix the level here.
-        if (inZone(bot) && SetBotLevelInRange(bot, bandLower, ceiling))
+        // In-zone bots the town keeps: their level already suits the zone they stand in.
+        if (inZone(bot) && BotSuitsItsZone(bot))
         {
-            ++changed;
-            --need;
-            if (!unlimited)
+            continue;
+        }
+
+        // In the zone but out of step with it: no teleport, just bring it to the player's level, which
+        // is what makes it one of the bots the player can group with.
+        if (inZone(bot))
+        {
+            if (SetBotLevelInRange(bot, bandLower, ceiling))
             {
-                --areaBudget;
+                ++changed;
+                --need;
+                if (!unlimited)
+                {
+                    --areaBudget;
+                }
             }
             continue;
         }
-        // A bot relocates itself in the same zone when it is out of the band, so the teleport below
-        // stays a genuine move. Unsafe or unchangeable bots keep their level untouched.
-        if (!inBand(bot) && !SetBotLevelInRange(bot, bandLower, ceiling))
+
+        // Out of the zone: relevel it, then move it in. A spread bot is levelled to the zone's own band
+        // first - it has to be, because the teleport location is picked from the bot's own level pool,
+        // so a level 80 bot has no location inside a level 10 zone to be sent to at all.
+        int botBandLower = 0;
+        int botCeiling = 0;
+        bool botSpread = false;
+        ResolveGatherBand(bot, zoneId, bandLower, ceiling, botBandLower, botCeiling, botSpread);
+        int const botLevel = static_cast<int>(bot->GetLevel());
+        bool const botInBand = botLevel >= botBandLower && botLevel <= botCeiling;
+        // A bot that cannot be releveled (a low Death Knight, a clamped one) is left where it is rather
+        // than dropped into a zone where it would be out of place.
+        if (!botInBand && !SetBotLevelInRange(bot, botBandLower, botCeiling))
         {
             continue;
         }
@@ -1142,6 +1228,110 @@ static uint32 GatherIntoZone(std::vector<Player*> const& eligible, Player* targe
         }
     }
     return changed;
+}
+
+// True for the ZoneSpreadPercent share of the population. The roll is recomputed every time a bot is
+// looked at, so the same bot drifts between "the player's level" and "the zone's level" instead of the
+// two groups being fixed for the session.
+static bool RollZoneSpread()
+{
+    return g_ZoneSpreadPercent > 0 && urand(1, 100) <= g_ZoneSpreadPercent;
+}
+
+// A bot's level range when nothing about the zone is known: the world cap and playerbots' own limits.
+static void WorldLevelRange(int& lowOut, int& highOut)
+{
+    int const worldMax = static_cast<int>(sWorld->getIntConfig(CONFIG_MAX_PLAYER_LEVEL));
+    lowOut = static_cast<int>(g_RandomBotMinLevel);
+    highOut = std::min(worldMax, static_cast<int>(g_RandomBotMaxLevel));
+}
+
+// The band a spread bot is releveled to: the level of the zone it lands in, +/- TargetBand, clamped
+// to the zone's own [minLevel, maxLevel] from the creature spawns and then to the world range. An
+// unknown zone (no spawn map, no believable bracket) falls back to the whole world range.
+static void ComputeZoneLevelBand(uint32 zoneId, int& bandLowerOut, int& ceilingOut)
+{
+    int low = 0;
+    int high = 0;
+    WorldLevelRange(low, high);
+
+    if (AreaTableEntry const* area = sAreaTableStore.LookupEntry(zoneId))
+    {
+        if (int const areaLevel = static_cast<int>(area->area_level))
+        {
+            low = areaLevel - static_cast<int>(g_TargetBand);
+            high = areaLevel + static_cast<int>(g_TargetBand);
+        }
+    }
+
+    auto spawns = CreatureLevelsInZone.find(zoneId);
+    if (spawns != CreatureLevelsInZone.end())
+    {
+        low = std::max(low, spawns->second.first);
+        high = std::min(high, spawns->second.second);
+    }
+
+    int worldLow = 0;
+    int worldHigh = 0;
+    WorldLevelRange(worldLow, worldHigh);
+    bandLowerOut = std::max(std::min(low, high), worldLow);
+    ceilingOut = std::min(std::max(low, high), worldHigh);
+    if (bandLowerOut > ceilingOut)
+    {
+        bandLowerOut = worldLow;
+        ceilingOut = worldHigh;
+    }
+}
+
+// Resolves the band for one bot about to be gathered: the player's band, or the zone's own band for
+// the spread share. Rolling only when the bot is actually worked on keeps the player's band accurate
+// for the rest of the pass.
+static void ResolveGatherBand(Player* bot, uint32 zoneId, int playerBandLower, int playerCeiling,
+                              int& bandLowerOut, int& ceilingOut, bool& spreadOut)
+{
+    spreadOut = RollZoneSpread();
+    if (spreadOut)
+    {
+        ComputeZoneLevelBand(zoneId, bandLowerOut, ceilingOut);
+    }
+    else
+    {
+        bandLowerOut = playerBandLower;
+        ceilingOut = playerCeiling;
+    }
+
+    if (bot->getClass() == CLASS_DEATH_KNIGHT)
+    {
+        int const dkMinLevel = static_cast<int>(sWorld->getIntConfig(CONFIG_START_HEROIC_PLAYER_LEVEL));
+        bandLowerOut = std::max(bandLowerOut, dkMinLevel);
+        ceilingOut = std::max(ceilingOut, dkMinLevel);
+    }
+}
+
+// True when this bot's level already suits the zone it is standing in: it is a spread bot (the current
+// roll says so) and its level is inside that zone's band. The level steps skip such a bot, which is what
+// keeps a bot spread down to a low-level zone from being promoted straight back up on the next pass and
+// bounced between the two bands on every timer tick.
+static bool BotSuitsItsZone(Player* bot)
+{
+    if (g_ZoneSpreadPercent == 0 || !bot->IsInWorld())
+    {
+        return false;
+    }
+
+    // Only a zone with real creature levels can be "suit"ed; for any other zone the band above is the
+    // whole world range, which every bot fits and which would exempt the entire population.
+    uint32 const zoneId = bot->GetZoneId();
+    if (!CreatureLevelsInZone.count(zoneId))
+    {
+        return false;
+    }
+
+    int bandLower = 0;
+    int ceiling = 0;
+    ComputeZoneLevelBand(zoneId, bandLower, ceiling);
+    int const level = static_cast<int>(bot->GetLevel());
+    return level >= bandLower && level <= ceiling;
 }
 
 // Which part of the pass a call performs. The world timer alternates Level and Area across
@@ -1274,6 +1464,7 @@ public:
             return;
         }
         RefreshCaches();
+        BuildCreatureLevelsInZone();
         EvaluateDeathKnightGate();
         g_DkApplied = g_DkProgressionEnabled;
         LOG_INFO("server.loading",
@@ -1380,6 +1571,7 @@ public:
     {
         LoadConfig();
         RefreshCaches();
+        BuildCreatureLevelsInZone();
         EvaluateDeathKnightGate();
         g_DkApplied = g_DkProgressionEnabled;
         UpdateGlobalGearCap(nullptr);
@@ -1417,7 +1609,8 @@ public:
             {
                 int const level = static_cast<int>(bot->GetLevel());
                 if (g_AreaSyncEnabled && botZone && bot->GetMapId() == targetPlayer->GetMapId() &&
-                    bot->GetZoneId() == botZone && level >= bandLower && level <= ceiling)
+                    bot->GetZoneId() == botZone &&
+                    ((level >= bandLower && level <= ceiling) || BotSuitsItsZone(bot)))
                 {
                     ++inArea;
                 }
@@ -1443,7 +1636,7 @@ public:
                                      bandLower, ceiling, ceiling, g_TargetPercent, desiredNear);
             handler->PSendSysMessage("  Eligible: {} (in-band {}, above-ceiling {}, below-band {}), AllowDownleveling: {}.",
                                      eligible, inBand, aboveCeiling, belowBand, g_AllowDownleveling);
-            handler->PSendSysMessage("  AreaSync: {}, zone {} -> in-zone-and-in-band {} of desired {}.",
+            handler->PSendSysMessage("  AreaSync: {}, zone {} -> in-zone (player band or zone band) {} of desired {}.",
                                      g_AreaSyncEnabled,
                                      g_AreaSyncUsePlayerZone ? std::to_string(botZone) : std::to_string(g_AreaSyncZone),
                                      inArea, desiredNear);

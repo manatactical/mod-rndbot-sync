@@ -32,6 +32,19 @@ RndBotSync.TargetPercent = 30
 #        Half-width of the band around the target level (+/- levels). Default: 3
 RndBotSync.TargetBand = 3
 
+#    RndBotSync.ZoneSpreadPercent
+#        Share of the bots in the player's zone that are levelled to match the ZONE
+#        instead of the player, so a low-level bot does not stand in a level 1 zone
+#        as a level 80. Their level comes from the zone's own creatures (the min and
+#        max level of its spawns, narrowed by the zone's area level), and a zone
+#        with no believable level keeps the normal world range. 0 = every bot in the
+#        zone matches the player, which makes a max-level player's zone dead quiet
+#        at the levels of the mobs around them; 30-40 is a lively middle ground.
+#        The split is re-rolled every pass, so a bot drifts between the two bands
+#        rather than the same bots always being the low ones.
+#        Default: 0
+RndBotSync.ZoneSpreadPercent = 0
+
 #    RndBotSync.ProcessLimit
 #        Max bots adjusted per pass, shared across downleveling and promotion
 #        (0 = unlimited). When AreaSync is on, half of this budget is reserved for
