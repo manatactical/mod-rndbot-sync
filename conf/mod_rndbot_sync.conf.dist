@@ -116,9 +116,10 @@ RndBotSync.AreaSync.Enabled = 1
 #        Default: 0
 RndBotSync.AreaSync.ZoneId = 0
 
-#    Playerbots.RandomBotConcentrateInPlayerZone
-#        mod-playerbots' own switch (read from playerbots.conf, not from this file):
-#        when 1, its random teleports only pick level-appropriate open-world zones
+#    Playerbots.RandomBotConcentrateInPlayerZone / Playerbots.randomBotConcentrateInPlayerZone
+#        mod-playerbots' own switch (read from playerbots.conf, not from this file;
+#        newer playerbots builds spell the key in camelCase). When 1, its random
+#        teleports only pick level-appropriate open-world zones
 #        that hold a real player, instead of the whole world. The module forces it
 #        on while AreaSync is enabled, regardless of what playerbots.conf says, and
 #        restores the configured value when AreaSync is turned off.

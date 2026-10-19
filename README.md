@@ -119,7 +119,7 @@ All commands are administrator-only and work from the console and in-game.
 | `RndBotSync.IlvlSync.Enabled` | Boolean | 1 | Cap bot gear at the player's item level. |
 | `RndBotSync.AreaSync.Enabled` | Boolean | 1 | Progressively gather bots into the player's zone. |
 | `RndBotSync.AreaSync.ZoneId` | Integer | 0 | Pin the target zone id (e.g. 1519 = Stormwind City); 0 = the player's own zone. |
-| `Playerbots.RandomBotConcentrateInPlayerZone` | Boolean | 0 | Read from `playerbots.conf`, not from this file. Forced to 1 while area sync is enabled; restored when it is off. |
+| `Playerbots.RandomBotConcentrateInPlayerZone` | Boolean | 0 | Read from `playerbots.conf`, not from this file (newer playerbots builds spell it `Playerbots.randomBotConcentrateInPlayerZone`). Forced to 1 while area sync is enabled; restored when it is off. |
 | `RndBotSync.DeathKnightProgression.Enabled` | Boolean | 0 | Gate Death Knight bots on mod-individual-progression. |
 | `RndBotSync.DeathKnightProgression.RequiredState` | Integer | 13 | Required `ProgressionState` (1–18) to unlock DK bots (13 = WotLK content). |
 | `RndBotSync.FullDebugMode` | Boolean | 0 | Verbose logging. |

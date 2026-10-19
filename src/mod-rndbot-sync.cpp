@@ -208,8 +208,10 @@ static void LoadConfig()
     g_OriginalGearScoreLimit = sConfigMgr->GetOption<int32>("AiPlayerbot.RandomGearScoreLimit", 0);
     // playerbots' own "teleport random bots into a real player's zone" filter; see
     // UpdatePlayerZoneTeleport(). Read from config so switching AreaSync off restores the
-    // user's value rather than a stale override.
-    g_ConfiguredPlayerZoneTeleport = sConfigMgr->GetOption<bool>("Playerbots.RandomBotConcentrateInPlayerZone", false);
+    // user's value rather than a stale override. Key is the old spelling; playerbots'
+    // camelCase rename moved the C++ member, so accept that conf spelling too.
+    g_ConfiguredPlayerZoneTeleport = sConfigMgr->GetOption<bool>("Playerbots.RandomBotConcentrateInPlayerZone",
+        sConfigMgr->GetOption<bool>("Playerbots.randomBotConcentrateInPlayerZone", false));
     g_FullDebug = sConfigMgr->GetOption<bool>("RndBotSync.FullDebugMode", false);
     g_LiteDebug = sConfigMgr->GetOption<bool>("RndBotSync.LiteDebugMode", false);
 
@@ -639,12 +641,12 @@ static void UpdateGlobalGearCap(Player* targetPlayer)
 static void UpdatePlayerZoneTeleport()
 {
     bool const wanted = g_ConfiguredPlayerZoneTeleport || g_AreaSyncEnabled;
-    if (sPlayerbotAIConfig.RandomBotConcentrateInPlayerZone == wanted)
+    if (sPlayerbotAIConfig.randomBotConcentrateInPlayerZone == wanted)
     {
         return;
     }
 
-    sPlayerbotAIConfig.RandomBotConcentrateInPlayerZone = wanted;
+    sPlayerbotAIConfig.randomBotConcentrateInPlayerZone = wanted;
 
     if (g_FullDebug || g_LiteDebug)
     {
