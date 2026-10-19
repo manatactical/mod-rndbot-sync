@@ -50,7 +50,6 @@
 #include "ItemTemplate.h"
 #include "ObjectMgr.h"
 #include "CreatureData.h"
-#include "CreatureTemplate.h"
 #include "DBCStores.h"
 
 // Standard library
