@@ -1531,7 +1531,9 @@ static bool FillLfgRoles(Player* player)
     }
     for (uint32 id : dungeons)
     {
-        if (sLFGMgr->GetDungeonType(id) == lfg::LFG_TYPE_RAID)
+        // GetDungeonType is private in LFGMgr; the public dungeon record carries the same type.
+        lfg::LFGDungeonData const* data = sLFGMgr->GetLFGDungeon(id);
+        if (data && data->type == lfg::LFG_TYPE_RAID)
         {
             return true;
         }
