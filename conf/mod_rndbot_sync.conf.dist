@@ -42,6 +42,9 @@ RndBotSync.TargetBand = 3
 #        at the levels of the mobs around them; 30-40 is a lively middle ground.
 #        The split is re-rolled every pass, so a bot drifts between the two bands
 #        rather than the same bots always being the low ones.
+#        A gathered bot in this share is sent to any level-fitting teleport location
+#        on the player's map, not only the player's zone. No bot is ever placed
+#        within 60 yards of the player.
 #        Default: 0
 RndBotSync.ZoneSpreadPercent = 0
 
@@ -135,6 +138,16 @@ RndBotSync.AreaSync.Enabled = 1
 #        zone, which is what "the same zone as the player" means.
 #        Default: 0
 RndBotSync.AreaSync.ZoneId = 0
+
+#    RndBotSync.LfgFill.Enabled
+#        When 1 and a real player (or their party) joins the dungeon finder, online
+#        random bots are levelled to that player's level and queued right away for
+#        whichever of tank / healer / 3 DPS the party is missing. Gear is re-rolled
+#        for the new level (and capped by IlvlSync). Raids are never filled.
+#        Keep Playerbots.RandomBotJoinLfg = 1: with it off, playerbots' periodic
+#        "lfg leave" pulls queued random bots back out of the queue.
+#        Default: 1
+RndBotSync.LfgFill.Enabled = 1
 
 #    RndBotSync.FactionSync.Enabled
 #        When 1 and the online real players are all on one faction, every random bot

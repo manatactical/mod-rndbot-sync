@@ -47,6 +47,11 @@ an empty world.
   zone finds level-10 bots there instead of an empty field. Their level comes from the
   zone's own creature spawns; the share is re-rolled each pass so the same bots are not
   always the low ones. `0` (the default) keeps the old player-level-only behaviour.
+- **Dungeon finder fill** — when a real player (or party) queues for a dungeon, up to
+  four online random bots are levelled to the player's level (gear re-rolled, capped by
+  the ilvl sync) and queued for the missing tank/healer/DPS roles. Bots are taken from
+  the already-online population, not logged in; if no bot of a role is available the
+  queue is left short. Raids are never filled.
 - **Faction mirroring** — when the online real players are all on one faction, every
   random bot is put on that faction (playerbots' alliance/horde ratios are driven to
   100/0), so a Horde-only realm stops filling half its world with Alliance bots. Both
@@ -119,6 +124,7 @@ All commands are administrator-only and work from the console and in-game.
 | `RndBotSync.TargetPercent` | Integer | 30 | Percent of eligible bots to keep within the band; with area sync on, the same number is the in-zone-in-band quota. |
 | `RndBotSync.TargetBand` | Integer | 3 | Band half-width (± levels) and ceiling offset. |
 | `RndBotSync.ZoneSpreadPercent` | Integer | 0 | Percent of the zone's bots levelled to the zone's own creature level instead of the player's. |
+| `RndBotSync.LfgFill.Enabled` | Boolean | 1 | When a real player queues for a dungeon, level online random bots to their level and queue them for the roles the player's party is missing. |
 | `RndBotSync.ProcessLimit` | Integer | 5 | Max bots adjusted per pass (`0` = unlimited). |
 | `RndBotSync.AllowDownleveling` | Boolean | 1 | Pull bots above the ceiling down. `0` = upward-only. |
 | `RndBotSync.IgnoreGuildBotsWithRealPlayers` | Boolean | 1 | Skip bots in a guild with any real-player member. |

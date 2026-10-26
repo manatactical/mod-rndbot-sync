@@ -45,6 +45,9 @@
 #include "PlayerbotFactory.h"
 #include "TravelMgr.h"
 #include "Group.h"
+#include "LFGMgr.h"
+#include "Opcodes.h"
+#include "WorldPacket.h"
 #include "SocialMgr.h"
 #include "Item.h"
 #include "Bag.h"
@@ -98,6 +101,7 @@ static bool   g_AreaSyncEnabled = true;     // gather bots into the player's zon
 static uint32 g_AreaSyncZone = 0;           // fixed zone id; 0 = follow the player's zone
 static bool   g_AreaSyncUsePlayerZone = true; // true = use the player's current zone id
 static uint32 g_ZoneSpreadPercent = 30;     // % of a zone's bots matched to the zone's own level
+static bool   g_LfgFillEnabled = true;      // queue same-level bots for a real player's missing LFG roles
 static bool   g_FactionSyncEnabled = true;  // force every bot onto the real players' faction
 // playerbots' configured ratios, kept so switching FactionSync off restores them.
 static uint32 g_ConfiguredAllianceRatio = 50;
@@ -218,6 +222,7 @@ static void LoadConfig()
     g_AreaSyncZone = areaSyncZone;
     g_AreaSyncUsePlayerZone = (areaSyncZone == 0);
     g_ZoneSpreadPercent = std::min<uint32>(sConfigMgr->GetOption<uint32>("RndBotSync.ZoneSpreadPercent", 30), 100);
+    g_LfgFillEnabled = sConfigMgr->GetOption<bool>("RndBotSync.LfgFill.Enabled", true);
     g_FactionSyncEnabled = sConfigMgr->GetOption<bool>("RndBotSync.FactionSync.Enabled", true);
     g_ConfiguredAllianceRatio = sConfigMgr->GetOption<uint32>("Playerbots.RandomBotAllianceRatio",
         sConfigMgr->GetOption<uint32>("AiPlayerbot.RandomBotAllianceRatio", 50));
@@ -804,6 +809,11 @@ static bool IsBotSafeToAdjust(Player* bot)
     {
         return false;
     }
+    // Queued, in a proposal or inside an LFG dungeon: a level change would unmatch the group.
+    if (sLFGMgr->GetState(bot->GetGUID()) != lfg::LFG_STATE_NONE)
+    {
+        return false;
+    }
     return true;
 }
 
@@ -816,7 +826,8 @@ static bool IsBotSafeToTeleport(Player* bot)
     {
         return false;
     }
-    if (bot->InBattleground() || bot->InArena() || bot->InBattlegroundQueue() || bot->IsInFlight())
+    if (bot->InBattleground() || bot->InArena() || bot->InBattlegroundQueue() || bot->IsInFlight() ||
+        sLFGMgr->GetState(bot->GetGUID()) != lfg::LFG_STATE_NONE)
     {
         return false;
     }
@@ -843,6 +854,7 @@ static bool BotMapAllowed(uint32 mapId)
 // shortcut: the level-keyed location cache only covers maps listed in Playerbots.RandomBotMaps;
 // a zone outside that list (a dungeon, a battleground, a map the admin excluded) finds no
 // location and the bot is skipped. Extend with map grid generation if that ever matters.
+static float const MinSpawnDistFromPlayer = 60.0f;
 static bool FindZoneTeleportPosition(Player* bot, Player* targetPlayer, uint32 zoneId, Position& out)
 {
     Map* map = targetPlayer->GetMap();
@@ -855,7 +867,13 @@ static bool FindZoneTeleportPosition(Player* bot, Player* targetPlayer, uint32 z
         {
             continue;
         }
-        if (map->GetZoneId(PHASEMASK_NORMAL, loc.GetPositionX(), loc.GetPositionY(), loc.GetPositionZ()) != zoneId)
+        // zoneId 0 = any zone on the map (a spread bot); otherwise only the target zone.
+        if (zoneId && map->GetZoneId(PHASEMASK_NORMAL, loc.GetPositionX(), loc.GetPositionY(), loc.GetPositionZ()) != zoneId)
+        {
+            continue;
+        }
+        // Never land on top of the player; the zone's other locations are used instead.
+        if (targetPlayer->GetExactDist2d(loc.GetPositionX(), loc.GetPositionY()) < MinSpawnDistFromPlayer)
         {
             continue;
         }
@@ -890,7 +908,7 @@ static bool FindZoneTeleportPosition(Player* bot, Player* targetPlayer, uint32 z
 // mod-playerbots' own teleport locations for that zone. Instances are skipped: a
 // WorldLocation carries no instance id, so a bot would land in another instance of the
 // same map. Returns false when the bot is already in the zone or cannot be moved.
-static bool MoveBotToPlayerZone(Player* bot, Player* targetPlayer, uint32 zoneId)
+static bool MoveBotToPlayerZone(Player* bot, Player* targetPlayer, uint32 zoneId, bool anyZone)
 {
     if (!zoneId || !bot || !targetPlayer || !bot->IsInWorld() || !bot->GetSession() ||
         bot->GetSession()->IsLoggingOut() || bot->IsDuringRemoveFromWorld())
@@ -903,7 +921,7 @@ static bool MoveBotToPlayerZone(Player* bot, Player* targetPlayer, uint32 zoneId
     {
         return false;
     }
-    if (bot->GetMapId() == map->GetId() && bot->GetZoneId() == zoneId)
+    if (!anyZone && bot->GetMapId() == map->GetId() && bot->GetZoneId() == zoneId)
     {
         return false;
     }
@@ -913,7 +931,7 @@ static bool MoveBotToPlayerZone(Player* bot, Player* targetPlayer, uint32 zoneId
     }
 
     Position pos;
-    if (!FindZoneTeleportPosition(bot, targetPlayer, zoneId, pos))
+    if (!FindZoneTeleportPosition(bot, targetPlayer, anyZone ? 0 : zoneId, pos))
     {
         return false;
     }
@@ -1185,7 +1203,8 @@ static uint32 GatherIntoZone(std::vector<Player*> const& eligible, Player* targe
             break;
         }
         // In-zone bots the town keeps: their level already suits the zone they stand in.
-        if (inZone(bot) && BotSuitsItsZone(bot))
+        // Also covers spread bots already placed in another zone, so they are not pulled back.
+        if (BotSuitsItsZone(bot))
         {
             continue;
         }
@@ -1222,7 +1241,8 @@ static uint32 GatherIntoZone(std::vector<Player*> const& eligible, Player* targe
             continue;
         }
         // Unsafe, unreachable or zone-less bots are skipped without spending budget or the deficit.
-        if (MoveBotToPlayerZone(bot, targetPlayer, zoneId))
+        // A spread bot goes to any level-fitting location on the map, not only the player's zone.
+        if (MoveBotToPlayerZone(bot, targetPlayer, zoneId, botSpread))
         {
             ++changed;
             --need;
@@ -1453,6 +1473,148 @@ static void RefreshCaches()
     RefreshRealPlayerGuildCache();
 }
 
+// ---- Dungeon finder fill -----------------------------------------------------
+// The CanJoinLfg hook fires inside LFGMgr::JoinLfg, before the player is queued, so the bots are queued
+// from a later world tick instead of re-entering the LFG manager from inside it.
+struct LfgPending
+{
+    ObjectGuid guid;
+    uint32 tries;
+};
+static std::vector<LfgPending> g_LfgPending;
+static uint32 const MaxLfgReLevels = 10; // re-rolling gear is heavy; bounds the cost of one queue
+
+// Role index (0 tank, 1 healer, 2 DPS) a bot plays from its current spec. Uses mod-playerbots' own
+// spec test, so it agrees with the combat strategy the bot will actually run in the dungeon.
+static int BotLfgRoleIndex(Player* bot)
+{
+    if (PlayerbotAI::IsTank(bot, true))
+    {
+        return 0;
+    }
+    return PlayerbotAI::IsHeal(bot, true) ? 1 : 2;
+}
+
+// Same CMSG_LFG_JOIN packet mod-playerbots queues for its own bots: JoinLfg is not thread-safe
+// from the bot's side, and the session handler also runs the dungeon-finder-enabled check.
+static void QueueBotForLfg(Player* bot, uint8 role, lfg::LfgDungeonSet const& dungeons)
+{
+    WorldPacket* data = new WorldPacket(CMSG_LFG_JOIN);
+    *data << static_cast<uint32>(role);
+    *data << false << false;
+    *data << static_cast<uint8>(dungeons.size());
+    for (uint32 id : dungeons)
+    {
+        *data << id;
+    }
+    *data << static_cast<uint8>(3) << static_cast<uint8>(0) << static_cast<uint8>(0) << static_cast<uint8>(0);
+    *data << std::string();
+    bot->GetSession()->QueuePacket(data);
+}
+
+// Queues same-level bots for the roles the player's party lacks. Returns false while the party is still
+// in its role check (try again later), true once finished or when there is nothing to do.
+// shortcut: bots come from the already-online random population; if none of a role is online the queue
+// stays short. Upgrade to logging in offline bots if that proves too thin.
+static bool FillLfgRoles(Player* player)
+{
+    ObjectGuid const guid = player->GetGUID();
+    lfg::LfgState const state = sLFGMgr->GetState(guid);
+    if (state == lfg::LFG_STATE_ROLECHECK)
+    {
+        return false;
+    }
+    lfg::LfgDungeonSet const dungeons = sLFGMgr->GetSelectedDungeons(guid);
+    if (state != lfg::LFG_STATE_QUEUED || dungeons.empty())
+    {
+        return true;
+    }
+    for (uint32 id : dungeons)
+    {
+        if (sLFGMgr->GetDungeonType(id) == lfg::LFG_TYPE_RAID)
+        {
+            return true;
+        }
+    }
+
+    // Roles the party already holds: 1 tank, 1 healer, 3 DPS in a full group.
+    int need[3] = { 1, 1, 3 };
+    uint32 size = 0;
+    Group* grp = player->GetGroup();
+    std::vector<ObjectGuid> members;
+    if (grp)
+    {
+        for (GroupReference* itr = grp->GetFirstMember(); itr; itr = itr->next())
+        {
+            if (Player* m = itr->GetSource())
+            {
+                members.push_back(m->GetGUID());
+            }
+        }
+    }
+    else
+    {
+        members.push_back(guid);
+    }
+    for (ObjectGuid const& mg : members)
+    {
+        uint8 const r = sLFGMgr->GetRoles(mg);
+        int const idx = (r & lfg::PLAYER_ROLE_TANK) ? 0 : (r & lfg::PLAYER_ROLE_HEALER) ? 1 : 2;
+        need[idx] = std::max(0, need[idx] - 1);
+        ++size;
+    }
+    uint32 slots = size >= 5 ? 0 : 5 - size;
+
+    uint8 const roles[3] = { lfg::PLAYER_ROLE_TANK, lfg::PLAYER_ROLE_HEALER, lfg::PLAYER_ROLE_DAMAGE };
+    std::vector<Player*> bots = CollectEligibleBots();
+    std::shuffle(bots.begin(), bots.end(), RandomEngine::Instance());
+    uint8 const level = player->GetLevel();
+    uint32 queued = 0;
+    uint32 releveled = 0;
+    for (Player* bot : bots)
+    {
+        if (!slots || (!need[0] && !need[1] && !need[2]))
+        {
+            break;
+        }
+        if (bot->GetGroup() || bot->GetTeamId() != player->GetTeamId() ||
+            sLFGMgr->GetState(bot->GetGUID()) != lfg::LFG_STATE_NONE ||
+            bot->HasAura(lfg::LFG_SPELL_DUNGEON_DESERTER) || bot->HasAura(lfg::LFG_SPELL_DUNGEON_COOLDOWN))
+        {
+            continue;
+        }
+        // Judge the role before the (expensive) re-level, so only bots that fit a open slot are touched.
+        if (!need[BotLfgRoleIndex(bot)])
+        {
+            continue;
+        }
+        if (bot->GetLevel() != level)
+        {
+            if (releveled >= MaxLfgReLevels || !SetBotLevelInRange(bot, level, level))
+            {
+                continue;
+            }
+            ++releveled;
+            // A re-roll can change the spec; recheck against the slots that are still open.
+            if (!need[BotLfgRoleIndex(bot)])
+            {
+                continue;
+            }
+        }
+        int const idx = BotLfgRoleIndex(bot);
+        QueueBotForLfg(bot, roles[idx], dungeons);
+        // The packet is handled on the bot's next session update; a refused join just leaves the slot empty.
+        --need[idx];
+        --slots;
+        ++queued;
+    }
+    if (g_FullDebug)
+    {
+        LOG_INFO("server.loading", "[RndBotSync] LFG fill for '{}': queued {} bots.", player->GetName(), queued);
+    }
+    return true;
+}
+
 // ---- WorldScript -------------------------------------------------------------
 class RndBotSyncWorldScript : public WorldScript
 {
@@ -1503,6 +1665,23 @@ public:
             }
         }
 
+        // Every 2 s, serve queued LFG joins; gives up after 15 tries (a role check lasts well under 30 s).
+        m_lfgTimer += diff;
+        if (m_lfgTimer >= 2000)
+        {
+            m_lfgTimer = 0;
+            std::vector<LfgPending> pending;
+            pending.swap(g_LfgPending);
+            for (LfgPending& p : pending)
+            {
+                Player* player = ObjectAccessor::FindPlayer(p.guid);
+                if (player && !FillLfgRoles(player) && ++p.tries < 15)
+                {
+                    g_LfgPending.push_back(p);
+                }
+            }
+        }
+
         if (g_CheckFrequency == 0)
         {
             return; // Events-only mode.
@@ -1523,6 +1702,7 @@ public:
 private:
     uint64 m_timer;
     uint64 m_guildTimer;
+    uint32 m_lfgTimer = 0;
 };
 
 // ---- PlayerScript ------------------------------------------------------------
@@ -1552,6 +1732,21 @@ public:
             return;
         }
         RunAdjustmentPass();
+    }
+
+    // Never vetoes the join; only records that a real player is entering the queue.
+    bool OnPlayerCanJoinLfg(Player* player, uint8 /*roles*/, std::set<uint32>& /*dungeons*/,
+                            std::string const& /*comment*/) override
+    {
+        if (g_Enabled && g_LfgFillEnabled && IsHumanPlayer(player))
+        {
+            auto same = [&](LfgPending const& p) { return p.guid == player->GetGUID(); };
+            if (std::none_of(g_LfgPending.begin(), g_LfgPending.end(), same))
+            {
+                g_LfgPending.push_back({ player->GetGUID(), 0 });
+            }
+        }
+        return true;
     }
 };
 
