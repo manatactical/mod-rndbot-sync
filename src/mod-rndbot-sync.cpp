@@ -757,11 +757,72 @@ static std::pair<bool, bool> CollectRealPlayerTeams()
     return { alliance, horde };
 }
 
+// Retires random bots on a team the ratio no longer wants. playerbots applies the ratio only to
+// NEW logins (AddRandomBots) and a bot's team is fixed at creation, so a wrong-team bot only
+// leaves by logging out. Clearing its "add" event makes RandomPlayerbotMgr::ProcessBot() log it
+// out AND erase it from currentBots, which frees the slot for AddRandomBots() to refill. Do not
+// call LogoutPlayerBot()/Remove() directly: neither erases currentBots, so the slot stays lost.
+static void RetireFactionOutliers(uint32 allianceWanted, uint32 hordeWanted)
+{
+    uint32 const totalRatio = allianceWanted + hordeWanted;
+    if (!totalRatio)
+    {
+        return;
+    }
+
+    std::vector<Player*> allianceBots;
+    std::vector<Player*> hordeBots;
+    for (auto const& itr : ObjectAccessor::GetPlayers())
+    {
+        Player* bot = itr.second;
+        // Bots mid-battleground/instance are left alone so their team is not disrupted.
+        if (!bot || !bot->IsInWorld() || !IsPlayerRandomBot(bot) || IsBotExcluded(bot) ||
+            bot->InBattleground() || bot->InArena() || (bot->GetMap() && bot->GetMap()->IsDungeon()))
+        {
+            continue;
+        }
+        if (bot->GetTeamId() == TEAM_ALLIANCE)
+        {
+            allianceBots.push_back(bot);
+        }
+        else if (bot->GetTeamId() == TEAM_HORDE)
+        {
+            hordeBots.push_back(bot);
+        }
+    }
+
+    uint32 const total = uint32(allianceBots.size() + hordeBots.size());
+    // Quotient to Alliance, remainder to Horde, so rounding never retires a bot only to refill it
+    // with the same team.
+    uint32 const allowedAlliance = total * allianceWanted / totalRatio;
+
+    uint32 retired = 0;
+    auto retire = [&retired](std::vector<Player*>& bots, uint32 allowed)
+    {
+        if (bots.size() <= allowed)
+        {
+            return;
+        }
+        std::shuffle(bots.begin(), bots.end(), RandomEngine::Instance());
+        for (size_t i = allowed; i < bots.size(); ++i)
+        {
+            sRandomPlayerbotMgr.SetEventValue(bots[i]->GetGUID().GetCounter(), "add", 0, 0);
+            ++retired;
+        }
+    };
+    retire(allianceBots, allowedAlliance);
+    retire(hordeBots, total - allowedAlliance);
+
+    if (retired && (g_FullDebug || g_LiteDebug))
+    {
+        LOG_INFO("server.loading", "[RndBotSync] Retiring {} bot(s) for faction ratio {}A/{}H.",
+                 retired, allianceWanted, hordeWanted);
+    }
+}
+
 // Drives playerbots' random-bot faction ratios so every bot is on a team a real player is
-// playing. On a one-faction realm this is what stops half the bot population from logging in
-// as the empty faction, and it also pins the race a newly created bot character rolls
-// (RandomPlayerbotFactory::CreateRandomBot picks the team by coin flip). Both teams online,
-// or FactionSync switched off, restores the configured ratio.
+// playing, and retires bots already on the wrong team (see RetireFactionOutliers). Both teams
+// online, or FactionSync switched off, restores the configured ratio.
 static void UpdateFactionRatio()
 {
     auto const [allianceOnline, hordeOnline] = CollectRealPlayerTeams();
@@ -770,19 +831,23 @@ static void UpdateFactionRatio()
     uint32 const allianceWanted = mirror ? (allianceOnline ? 1u : 0u) : g_ConfiguredAllianceRatio;
     uint32 const hordeWanted = mirror ? (hordeOnline ? 1u : 0u) : g_ConfiguredHordeRatio;
 
-    if (sPlayerbotAIConfig.RandomBotAllianceRatio == allianceWanted &&
-        sPlayerbotAIConfig.RandomBotHordeRatio == hordeWanted)
+    if (sPlayerbotAIConfig.RandomBotAllianceRatio != allianceWanted ||
+        sPlayerbotAIConfig.RandomBotHordeRatio != hordeWanted)
     {
-        return;
+        sPlayerbotAIConfig.RandomBotAllianceRatio = allianceWanted;
+        sPlayerbotAIConfig.RandomBotHordeRatio = hordeWanted;
+
+        if (g_FullDebug || g_LiteDebug)
+        {
+            LOG_INFO("server.loading", "[RndBotSync] Bot faction ratio set to {}A/{}H (alliance online {}, horde online {}).",
+                     allianceWanted, hordeWanted, +allianceOnline, +hordeOnline);
+        }
     }
 
-    sPlayerbotAIConfig.RandomBotAllianceRatio = allianceWanted;
-    sPlayerbotAIConfig.RandomBotHordeRatio = hordeWanted;
-
-    if (g_FullDebug || g_LiteDebug)
+    // Not an early return: retirement must run every pass so a 50/50 target keeps draining surplus.
+    if (g_FactionSyncEnabled)
     {
-        LOG_INFO("server.loading", "[RndBotSync] Bot faction ratio set to {}A/{}H (alliance online {}, horde online {}).",
-                 allianceWanted, hordeWanted, +allianceOnline, +hordeOnline);
+        RetireFactionOutliers(allianceWanted, hordeWanted);
     }
 }
 

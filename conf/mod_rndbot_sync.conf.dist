@@ -152,13 +152,12 @@ RndBotSync.LfgFill.Enabled = 1
 #    RndBotSync.FactionSync.Enabled
 #        When 1 and the online real players are all on one faction, every random bot
 #        is put on that faction: the module sets playerbots' RandomBotAllianceRatio/
-#        RandomBotHordeRatio to 100/0 or 0/100, which is what decides the team of
-#        both a bot login and a newly created bot character. So a Horde-only realm
-#        stops spawning half its bots as Alliance. With players online on both
-#        factions (or nobody online) the ratios configured in playerbots.conf are
-#        restored. The ratio is re-evaluated on every pass and on reload, but the
-#        bots already logged in on the other faction keep playing until they next
-#        log out - they are not kicked.
+#        RandomBotHordeRatio to 100/0 or 0/100, which decides the team of each new
+#        bot login. With players online on both factions (or nobody online) the
+#        ratios configured in playerbots.conf are restored. The ratio is
+#        re-evaluated on every pass and on reload, and bots already logged in on
+#        the wrong team are retired (logged out and refilled from the wanted team),
+#        except excluded bots and bots in a battleground, arena or dungeon.
 #        Default: 1
 RndBotSync.FactionSync.Enabled = 1
 
