@@ -515,7 +515,7 @@ static void EvaluateDeathKnightGate()
     // to it, so "off" restores the configured value rather than a stale override.
     if (!g_OriginalDkCaptured)
     {
-        g_OriginalDisableDkLogin = sPlayerbotAIConfig.disableDeathKnightLogin;
+        g_OriginalDisableDkLogin = sPlayerbotAIConfig.DisableDeathKnightLogin;
         g_OriginalDkCaptured = true;
     }
 
@@ -526,20 +526,20 @@ static void EvaluateDeathKnightGate()
     if (!g_DkProgressionEnabled)
     {
         g_DkUnlocked = false;
-        sPlayerbotAIConfig.disableDeathKnightLogin = g_OriginalDisableDkLogin;
+        sPlayerbotAIConfig.DisableDeathKnightLogin = g_OriginalDisableDkLogin;
         return;
     }
 
     if (g_DkUnlocked)
     {
-        sPlayerbotAIConfig.disableDeathKnightLogin = false;
+        sPlayerbotAIConfig.DisableDeathKnightLogin = false;
         return;
     }
 
     std::vector<uint32> accountIds;
     if (!GetRealPlayerAccountIds(accountIds))
     {
-        sPlayerbotAIConfig.disableDeathKnightLogin = true;
+        sPlayerbotAIConfig.DisableDeathKnightLogin = true;
         return;
     }
 
@@ -558,7 +558,7 @@ static void EvaluateDeathKnightGate()
         }
     }
 
-    sPlayerbotAIConfig.disableDeathKnightLogin = !g_DkUnlocked;
+    sPlayerbotAIConfig.DisableDeathKnightLogin = !g_DkUnlocked;
 
     if (g_DkUnlocked)
     {
@@ -678,7 +678,7 @@ static uint32 GetBestOwnedItemLevel(Player* player)
 
 // Sets or restores the global gear-score cap so mod-playerbots caps all bot gear
 // (default bot init and re-randomize) at the target player's item level. Same
-// runtime-override pattern as the DK feature's disableDeathKnightLogin.
+// runtime-override pattern as the DK feature's DisableDeathKnightLogin.
 static void UpdateGlobalGearCap(Player* targetPlayer)
 {
     if (!g_IlvlSyncEnabled || !targetPlayer)
