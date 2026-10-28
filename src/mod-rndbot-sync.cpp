@@ -806,7 +806,7 @@ static void RetireFactionOutliers(uint32 allianceWanted, uint32 hordeWanted)
         std::shuffle(bots.begin(), bots.end(), RandomEngine::Instance());
         for (size_t i = allowed; i < bots.size(); ++i)
         {
-            sRandomPlayerbotMgr.SetEventValue(bots[i]->GetGUID().GetCounter(), "add", 0, 0);
+            sRandomPlayerbotMgr.SetValue(bots[i]->GetGUID().GetCounter(), "add", 0);
             ++retired;
         }
     };
